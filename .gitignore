@@ -1,0 +1,15 @@
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+.mypy_cache/
+.pytest_cache/
+data/output/
+data/input/*
+!data/input/.gitkeep
+*.pth
+*.onnx
+*.mlmodel
+*.mlpackage/
