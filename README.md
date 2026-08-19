@@ -1,13 +1,14 @@
 # RTMPose tennis player prototype
 
-See [optimizations.md](optimizations.md) for the chronological performance
-work, measured tradeoffs, and current benchmark configuration.
-
 A first-stage real-time pipeline that reads a live camera or video file, detects people with
 the detector bundled with MMPose's `human` alias, estimates body keypoints using
 RTMPose-small, and displays the annotated video. When several people are visible, the
 largest centrally located person is selected as the tennis player for downstream
 processing.
+
+See [optimizations.md](optimizations.md) for the chronological performance
+work, measured tradeoffs, and current benchmark configuration.
+
 
 ## Setup
 
@@ -62,7 +63,15 @@ rtmpose-tennis --camera 0
 For repeatable debugging with a recorded clip:
 
 ```bash
-rtmpose-tennis --video /path/to/tennis-clip.mp4
+PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
+  --video "./data/input/wnn.mp4" \
+  --device mps \
+  --detector-device cpu \
+  --model small \
+  --detector-interval 30 \
+  --crop-margin 0.35 \
+  --tracking-alpha 0.35 \
+  --preview-scale 0.5
 ```
 
 Local videos are intentionally excluded from version control. Place debugging
