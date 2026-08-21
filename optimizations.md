@@ -260,8 +260,9 @@ adaptive crop tracking, device splitting, and detailed profiling.
 
 ## Current tradeoffs and limitations
 
-- The application is synchronous, so display work still blocks inference.
-- A detector refresh still causes a roughly 200 ms latency spike.
+- Latest-frame capture can run asynchronously, but detector, pose, and display
+  work remain serialized in the processing loop.
+- A detector refresh still causes a roughly 230-260 ms latency spike.
 - `model FPS` excludes decoding and display; `output FPS` is the meaningful
   current end-to-end delivery rate.
 - Pose landmarks can be wrong during motion blur, limb crossing, or occlusion.
@@ -271,9 +272,10 @@ adaptive crop tracking, device splitting, and detailed profiling.
 - `PYTORCH_ENABLE_MPS_FALLBACK=1` is still useful for unsupported PyTorch MPS
   operations.
 
-## Next optimization
+## Asynchronous latest-frame input
 
-The next planned architectural step is asynchronous latest-frame processing:
+Live-camera and real-time simulated-video modes now support asynchronous
+latest-frame processing:
 
 ```text
 Capture thread -> always retain newest camera frame
@@ -281,6 +283,210 @@ Inference loop -> process newest available frame; discard stale frames
 Display        -> show newest completed pose
 ```
 
-This should reduce live-camera latency and allow capture/display work to overlap
-inference. The synchronous baseline above should be retained for regression and
-quality comparisons.
+Enable it for a camera with `--async-camera`. Enable a repeatable camera-like
+test from a video with `--video CLIP --realtime-video`; frames are released at
+the file's encoded FPS before entering the same one-frame latest buffer. Plain
+`--video` remains synchronous for deterministic regression and pose-quality
+comparisons.
+
+The overlay and terminal summary expose the measurements needed for an A/B
+comparison:
+
+- displayed-frame age p50 and p95;
+- frame wait before inference p95;
+- lag behind the newest captured sequence;
+- captured, processed, inferred, and stale-frame counts;
+- capture/output FPS and stale-frame percentage;
+- maximum displayed-frame age and maximum sequence lag;
+- normal-pose versus detector-refresh frame age;
+- steady-state measurements after a configurable warm-up period;
+- full-session and steady-state detector refresh reasons, separating scheduled
+  correction from missing crops/poses, low-confidence landmarks, and crop-edge
+  proximity.
+
+The default warm-up exclusion is three seconds and can be changed with
+`--metrics-warmup-seconds`. Full-session results are retained alongside the
+steady-state report so startup cost remains visible.
+
+The objective is bounded frame age rather than zero dropped frames. A real-time
+pipeline should discard obsolete frames instead of allowing latency to grow.
+
+### Crop correction before redetection
+
+Redetection diagnostics showed that fast videos could request RTMDet on nearly
+every crop-edge event even though pose tracking corrected the crop immediately
+afterward. The hybrid loop now updates the crop from the current pose before
+testing its edges. Missing poses and insufficient confident keypoints still
+request immediate recovery, while an edge-triggered refresh occurs only when
+the corrected crop remains unsafe.
+
+Detailed edge diagnostics identify the boundary side and COCO joints involved,
+record triggering confidence and landmark count, flag edges that cannot expand
+because the crop is clamped to the source frame, and measure consecutive events
+that repeat at least one identical joint/edge hit. Both complete-session and
+post-warm-up summaries are emitted for controlled tracker-policy experiments.
+
+When every landmark edge hit corresponds to a crop side already clamped to the
+source image, the event is now recorded but does not request immediate RTMDet.
+Periodic detection and missing/low-confidence pose recovery remain active. This
+prevents futile repeated detections when a correctly tracked athlete is close
+to the camera frame boundary.
+
+### Clamped-edge diagnosis and controlled experiments
+
+Four videos were first run with identical baseline settings:
+
+```text
+model=small, detector interval=30, crop margin=0.35,
+tracking alpha=0.35, preview scale=0.5
+```
+
+Detector-reason counters showed a progression from stable tracking to repeated
+edge-driven recovery:
+
+| Video | Scheduled | Crop edge | Low keypoints | Steady detector rate | Steady output |
+|---|---:|---:|---:|---:|---:|
+| `wnn.mp4` | 22 | 6 | 0 | 0.98/s | 24.9 FPS |
+| `female.mp4` | 15 | 11 | 0 | 0.95/s | 24.1 FPS |
+| `backview.mp4` | 19 | 60 | 5 | 1.76/s | 18.9 FPS |
+| `pro.mov` | 0 | 23 | 0 | 3.03/s | 8.8 FPS |
+
+RTMPose latency stayed near 40-59 ms while detector frames remained roughly
+230-260 ms. Overall throughput therefore followed detector frequency rather
+than pose speed.
+
+Three controlled changes were tested on `pro.mov`:
+
+1. increasing crop margin from 0.35 to 0.45;
+2. increasing tracking alpha from 0.35 to 0.50; and
+3. updating the crop before evaluating its edges.
+
+None materially reduced the number of crop-edge events. Detailed diagnostics
+then identified the actual condition: all 24 steady edge events occurred at a
+left crop edge already clamped to the source frame. The left ankle produced 21
+of 28 landmark/edge hits, with confidence p50/p95 of 0.76/0.98 and repeated
+streaks up to five frames. RTMDet could not reveal pixels outside the video, so
+these refreshes were futile.
+
+### Five-video validation
+
+After clamped-only edge suppression, the difficult videos improved strongly
+while the healthy videos did not regress:
+
+| Video | Source | Steady FPS before | Steady FPS after | Drop after | Refreshes before -> after | Suppressed edges |
+|---|---:|---:|---:|---:|---:|---:|
+| `wnn.mp4` | 30 FPS | 24.9 | 25.3 | 17.5% | 28 -> 25 | 0 |
+| `female.mp4` | 30 FPS | 24.1 | 25.2 | 17.2% | 26 -> 23 | 0 |
+| `backview.mp4` | 30 FPS | 18.9 | 23.8 | 21.4% | 84 -> 53 | 94 |
+| `pro.mov` | 58.6 FPS | 11.6 | 25.1 | 59.4% | 24 -> 9 | 80 |
+| `kid.mp4` | 30 FPS | not measured | 24.5 | 20.2% | not measured -> 19 | 44 |
+
+`pro.mov` more than doubled steady throughput, from 11.6 to 25.1 FPS, while
+normal-pose p95 remained 47.0 ms. Its 84 steady edge events divided exactly
+into 80 suppressed clamped-only events and four actionable detector requests.
+
+`backview.mp4` improved from 18.9 to 23.8 FPS and reduced frame replacement
+from 36.7% to 21.4%. Of 105 steady edge events, 94 were source-boundary-clamped
+and 11 remained actionable. Its missing/low-confidence recovery behavior was
+not disabled.
+
+`kid.mp4` contained a 43-frame repeated right-edge streak involving multiple
+high-confidence body landmarks. Forty-four clamped-only events were suppressed,
+yet three internal crop-edge events still requested recovery and scheduled
+detection continued at the expected rate.
+
+The 59.4% replacement rate for `pro.mov` is now primarily the expected mismatch
+between a 58.6 FPS input and a roughly 25 FPS processing path, not pathological
+detector repetition. Latest-frame replacement keeps normal pose age near
+40-47 ms instead of allowing latency to accumulate.
+
+### 15. Single-flight background RTMDet worker
+
+Periodic RTMDet refreshes can now run concurrently with crop-pose inference by
+passing `--async-detector`. The main loop submits a copy of the newest frame and
+continues tracking the current crop with RTMPose while the CPU detector works.
+Only one request may be pending or running, and another is not accepted until
+the completed result has been consumed. This prevents an unbounded detector
+queue from turning throughput into stale feedback.
+
+The synchronous path remains available by omitting the switch, allowing direct
+A/B testing. New exit metrics report background jobs submitted and completed,
+request-to-result latency p50/p95, and result staleness p50/p95 in source
+frames. These measurements tell us whether overlapping the roughly 230-260 ms
+detector refresh improves output FPS without applying detections that are too
+old to re-anchor a fast-moving player reliably.
+
+Example real-time benchmark:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
+  --video "./data/input/pro.mov" --realtime-video \
+  --device mps --detector-device cpu --model small \
+  --detector-interval 30 --async-detector \
+  --crop-margin 0.35 --tracking-alpha 0.5 --preview-scale 0.5
+```
+
+### Background-detector five-video validation
+
+The same five-video suite was rerun with `--async-detector`. The synchronous
+results below are the post-clamped-edge-suppression baseline, so the comparison
+isolates the benefit of overlapping RTMDet with crop-pose inference.
+
+| Video | Source FPS | Sync steady FPS | Async steady FPS | Gain | Sync drop | Async drop |
+|---|---:|---:|---:|---:|---:|---:|
+| `pro.mov` | 58.6 | 25.1 | 31.3 | +24.7% | 59.4% | 48.1% |
+| `wnn.mp4` | 30.0 | 25.3 | 30.0 | +18.6% | 17.5% | 1.4% |
+| `female.mp4` | 30.0 | 25.2 | 29.7 | +17.9% | 17.2% | 2.1% |
+| `backview.mp4` | 30.0 | 23.8 | 29.8 | +25.2% | 21.4% | 1.4% |
+| `kid.mp4` | 30.0 | 24.5 | 29.3 | +19.6% | 20.2% | 4.0% |
+
+Every video gained approximately 18-25% steady throughput. All 30 FPS sources
+reached 29.3-30.0 FPS, while the 58.6 FPS source improved to 31.3 FPS. Frame
+replacement on the 30 FPS clips fell from 17-21% to 1-4%. The remaining 48.1%
+replacement on `pro.mov` is expected because its source rate remains almost
+twice the processing rate.
+
+Freshness also improved in the long tail:
+
+| Video | Sync age p95 | Async age p95 | Sync max age | Async max age | Async max lag |
+|---|---:|---:|---:|---:|---:|
+| `pro.mov` | 139.4 ms | 51.3 ms | 241.7 ms | 75.0 ms | 4 frames |
+| `wnn.mp4` | 59.2 ms | 51.9 ms | 282.7 ms | 87.7 ms | 2 frames |
+| `female.mp4` | 54.9 ms | 56.7 ms | 255.8 ms | 163.3 ms | 4 frames |
+| `backview.mp4` | 63.2 ms | 56.9 ms | 304.0 ms | 105.6 ms | 3 frames |
+| `kid.mp4` | 43.6 ms | 60.6 ms | 249.7 ms | 80.8 ms | 2 frames |
+
+`kid.mp4` was the only clip with a meaningful p95 regression, from 43.6 to
+60.6 ms, probably reflecting CPU, memory-bandwidth, or scheduling contention
+while RTMDet and RTMPose overlap. Its median remained essentially unchanged,
+however, and its maximum age and source lag improved substantially. This is a
+tradeoff to watch on slower hardware rather than a reason to revert the worker.
+
+Background detector timing and result staleness were:
+
+| Video | Detector latency p50/p95 | Result lag p50/p95 |
+|---|---:|---:|
+| `pro.mov` | 225.9/255.9 ms | 13/15 frames |
+| `wnn.mp4` | 226.0/259.9 ms | 6/7 frames |
+| `female.mp4` | 258.4/350.9 ms | 7/10 frames |
+| `backview.mp4` | 254.4/267.0 ms | 7/8 frames |
+| `kid.mp4` | 263.5/269.2 ms | 7.5/8 frames |
+
+The larger frame lag on `pro.mov` represents approximately the same elapsed
+detector time at its higher source FPS. All submitted requests completed on the
+first four clips. On `kid.mp4`, 25 of 26 completed results were consumed; the
+last request was still outstanding when the video ended and therefore had no
+later frame on which its result could be applied.
+
+Recovery behavior remained controlled. `backview.mp4`, the most difficult
+30 FPS case, used seven crop-edge and six low-keypoint refreshes while reaching
+29.8 FPS. `kid.mp4` retained its long source-boundary streak, but 48 of 52 edge
+events were clamped-only and only two crop-edge refreshes were submitted.
+Single-flight submission coalesced repeated edge observations instead of
+building a queue of stale detector work.
+
+The background worker is therefore retained. Motion compensation for stale
+detections is deferred unless visual testing reveals a crop jump when a result
+arrives; the throughput, freshness, and recovery counters do not currently
+show a need for that added complexity. The next optimization should be chosen
+from a fresh timing profile now that synchronous RTMDet stalls are removed.

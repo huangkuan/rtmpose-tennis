@@ -82,6 +82,52 @@ their own appropriately licensed footage.
 index 0 is used. Video processing exits cleanly at the end of the file and runs
 as fast as inference permits.
 
+For low-latency live capture, continuously read the camera on a background
+thread and retain only its newest frame:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
+  --camera 0 --async-camera \
+  --device mps --detector-device cpu \
+  --model small --detector-interval 30 --async-detector --crop-margin 0.35 \
+  --tracking-alpha 0.35 --preview-scale 0.5
+```
+
+To test the same latest-frame behavior repeatably with a recorded clip, pace it
+at its encoded frame rate:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
+  --video "./data/input/wnn.mp4" --realtime-video \
+  --device mps --detector-device cpu \
+  --model small --detector-interval 30 --async-detector --crop-margin 0.35 \
+  --tracking-alpha 0.35 --preview-scale 0.5
+```
+
+Normal `--video` mode remains synchronous and processes frames in order as fast
+as possible. Use it for landmark-quality checks and deterministic debugging;
+use `--realtime-video` for camera-like latency and frame-dropping benchmarks.
+The overlay and exit summary report displayed-frame age p50/p95, inference wait
+p95, sequence lag, and the percentage of frames deliberately replaced by the
+latest-frame buffer. The terminal summary additionally reports capture and
+processing FPS, counts, maximum latency, and separate detector-refresh and
+normal-pose latency. Steady-state results exclude the first three seconds by
+default; adjust this with `--metrics-warmup-seconds SECONDS`. Hybrid mode also
+reports why each detector refresh occurred: `scheduled_interval`,
+`missing_crop`, `missing_pose`, `low_keypoints`, or `crop_edge`. Edge diagnostics
+break those events down by boundary side, triggering COCO joint, confidence,
+landmarks per event, source-frame clamping, and repeated same-joint/edge streaks.
+An edge event does not request immediate detection when every triggering side is
+already clamped to the source image, because detection cannot reveal pixels
+beyond that boundary; these suppressed events are counted separately.
+
+`--async-detector` moves periodic RTMDet refreshes to a single-flight
+background worker. Crop-pose inference continues while detection is running;
+new requests are rejected until the outstanding result is consumed, so stale
+detector jobs cannot accumulate. The terminal reports submitted/completed jobs,
+request-to-result latency, and result lag in source frames. Omit the switch to
+retain the synchronous detector for A/B comparisons.
+
 Useful options:
 
 ```bash
