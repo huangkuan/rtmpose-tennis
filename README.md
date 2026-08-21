@@ -63,14 +63,16 @@ rtmpose-tennis --camera 0
 For repeatable debugging with a recorded clip:
 
 ```bash
-PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
-  --video "./data/input/wnn.mp4" \
+PYTORCH_ENABLE_MPS_FALLBACK=1 python -m rtmpose_tennis.app \
+  --video "./data/input/kid.mp4" \
+  --realtime-video \
   --device mps \
   --detector-device cpu \
   --model small \
   --detector-interval 30 \
+  --async-detector \
   --crop-margin 0.35 \
-  --tracking-alpha 0.35 \
+  --tracking-alpha 0.5 \
   --preview-scale 0.5
 ```
 
