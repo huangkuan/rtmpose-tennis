@@ -490,3 +490,25 @@ detections is deferred unless visual testing reveals a crop jump when a result
 arrives; the throughput, freshness, and recovery counters do not currently
 show a need for that added complexity. The next optimization should be chosen
 from a fresh timing profile now that synchronous RTMDet stalls are removed.
+
+### 16. Headless pose-output mode
+
+The final coaching product will not show a video preview: pose analysis will
+ultimately produce audible instructions. The `--headless` path therefore
+removes preview resizing, skeleton and text drawing, window creation,
+`imshow`, and `waitKey` from the critical path while leaving capture,
+detection, pose inference, tracking, diagnostics, and metrics intact.
+
+Headless sessions report successful pose-output FPS separately from processed
+frame rate and inference-attempt count. A compact status line is printed every
+two seconds by default, including pose-output FPS, processed FPS, rolling frame
+age p50/p95, crop-pose latency, and dropped-frame percentage. The interval is
+configurable with `--status-interval`. End-of-video and Ctrl+C shutdown both
+produce the complete session summary, including background-detector metrics.
+
+This mode establishes the production-relevant compute ceiling without spending
+roughly 13 ms per frame on debugging visuals. The graphical path remains
+available for landmark-quality and crop-stability inspection. The next
+benchmark should compare preview and headless runs on the five-video suite,
+with special attention to pose-output FPS and capture-to-pose age on the
+58.6 FPS `pro.mov` source.

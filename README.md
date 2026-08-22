@@ -130,6 +130,24 @@ detector jobs cannot accumulate. The terminal reports submitted/completed jobs,
 request-to-result latency, and result lag in source frames. Omit the switch to
 retain the synchronous detector for A/B comparisons.
 
+For the screenless production path, use `--headless` to bypass preview resize,
+drawing, overlays, window creation, and display calls while retaining all
+performance measurements:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
+  --video "./data/input/pro.mov" --realtime-video \
+  --device mps --detector-device cpu --model small \
+  --detector-interval 30 --async-detector \
+  --crop-margin 0.35 --tracking-alpha 0.5 --headless
+```
+
+Headless mode prints a compact live status every two seconds and the normal
+detailed summary at shutdown. Change the live reporting cadence with
+`--status-interval SECONDS`. `pose output` counts successful pose samples, not
+preview frames or inference attempts. Stop a headless camera session with
+Ctrl+C; shutdown remains clean and prints the final metrics.
+
 Useful options:
 
 ```bash

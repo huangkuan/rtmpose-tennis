@@ -778,6 +778,18 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Display scale from 0 to 1; inference remains full resolution (default: 1.0)",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Disable the graphical preview while retaining live and final performance metrics",
+    )
+    parser.add_argument(
+        "--status-interval",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="Headless live-metrics reporting interval (default: 2)",
+    )
     args = parser.parse_args()
     if args.infer_every < 1:
         parser.error("--infer-every must be at least 1")
@@ -813,6 +825,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--redetect-edge must be between 0 and 0.5")
     if not 0 < args.preview_scale <= 1:
         parser.error("--preview-scale must be greater than 0 and at most 1")
+    if args.status_interval <= 0:
+        parser.error("--status-interval must be greater than 0")
     return args
 
 
@@ -861,6 +875,7 @@ def main() -> None:
     decode_timings: deque[float] = deque(maxlen=60)
     detector_timings: deque[float] = deque(maxlen=20)
     pose_timings: deque[float] = deque(maxlen=60)
+    session_pose_timings: list[float] = []
     display_timings: deque[float] = deque(maxlen=60)
     loop_timings: deque[float] = deque(maxlen=60)
     inference_wait_timings: deque[float] = deque(maxlen=120)
@@ -877,6 +892,8 @@ def main() -> None:
     dropped_frames = 0
     processed_frames = 0
     inferred_frames = 0
+    pose_output_frames = 0
+    steady_pose_output_frames = 0
     steady_processed_frames = 0
     detector_refreshes = 0
     steady_detector_refreshes = 0
@@ -901,7 +918,14 @@ def main() -> None:
         if args.async_detector and detector_inferencer is not None
         else None
     )
-    cv2.namedWindow("RTMPose Tennis", cv2.WINDOW_NORMAL)
+    if not args.headless:
+        cv2.namedWindow("RTMPose Tennis", cv2.WINDOW_NORMAL)
+    else:
+        print(
+            "Headless mode enabled: preview rendering is disabled; "
+            "press Ctrl+C to stop a live session.",
+            flush=True,
+        )
     async_capture: LatestFrameCapture | None = None
     if args.async_camera or args.realtime_video:
         if args.realtime_video:
@@ -921,6 +945,8 @@ def main() -> None:
     session_started = time.perf_counter()
     warmup_ends = session_started + args.metrics_warmup_seconds
     session_ended = session_started
+    status_last_at = session_started
+    status_last_pose_outputs = 0
     try:
         for frame_index, packet in enumerate(frame_source):
             loop_started = time.perf_counter()
@@ -1033,7 +1059,9 @@ def main() -> None:
                         crop = frame[y1:y2, x1:x2]
                         pose_started = time.perf_counter()
                         result = next(crop_inferencer(crop, return_vis=False))
-                        pose_timings.append(time.perf_counter() - pose_started)
+                        pose_seconds = time.perf_counter() - pose_started
+                        pose_timings.append(pose_seconds)
+                        session_pose_timings.append(pose_seconds)
                         crop_player = select_player(result, crop.shape)
                         player = move_pose_to_frame(crop_player, player_crop)
                         if player is not None:
@@ -1079,10 +1107,63 @@ def main() -> None:
                     stage_seconds = time.perf_counter() - stage_started
                     if args.whole_image:
                         pose_timings.append(stage_seconds)
+                        session_pose_timings.append(stage_seconds)
                     else:
                         detector_timings.append(stage_seconds)
                     player = select_player(result, frame.shape)
                 inference_timings.append(time.perf_counter() - inference_started)
+                if player is not None:
+                    pose_output_frames += 1
+                    if time.perf_counter() >= warmup_ends:
+                        steady_pose_output_frames += 1
+            if args.headless:
+                completed_at = time.perf_counter()
+                frame_age = completed_at - packet.captured_at
+                frame_age_timings.append(frame_age)
+                session_frame_ages.append(frame_age)
+                latest_sequence = (
+                    async_capture.latest_sequence
+                    if async_capture is not None
+                    else packet.sequence
+                )
+                sequence_lag = max(0, latest_sequence - packet.sequence)
+                sequence_lags.append(sequence_lag)
+                max_sequence_lag = max(max_sequence_lag, sequence_lag)
+                session_ended = completed_at
+                if completed_at >= warmup_ends:
+                    steady_processed_frames += 1
+                    steady_frame_ages.append(frame_age)
+                    steady_max_sequence_lag = max(steady_max_sequence_lag, sequence_lag)
+                    if frame_stage == "detector":
+                        steady_detector_ages.append(frame_age)
+                    elif frame_stage == "pose":
+                        steady_pose_ages.append(frame_age)
+                if completed_at - status_last_at >= args.status_interval:
+                    interval_duration = completed_at - status_last_at
+                    interval_pose_outputs = pose_output_frames - status_last_pose_outputs
+                    captured_so_far = (
+                        async_capture.latest_sequence + 1
+                        if async_capture is not None
+                        else packet.sequence + 1
+                    )
+                    skipped_so_far = max(
+                        dropped_frames,
+                        captured_so_far - processed_frames,
+                    )
+                    print(
+                        "Headless status: "
+                        f"pose output={rate(interval_pose_outputs, interval_duration):.1f} FPS, "
+                        f"processed={rate(processed_frames, completed_at - session_started):.1f} FPS, "
+                        f"age p50/p95={percentile_ms(frame_age_timings, 50)}/"
+                        f"{percentile_ms(frame_age_timings, 95)} ms, "
+                        f"pose={average_ms(pose_timings)} ms, "
+                        f"dropped={100.0 * skipped_so_far / max(captured_so_far, 1):.1f}%",
+                        flush=True,
+                    )
+                    status_last_at = completed_at
+                    status_last_pose_outputs = pose_output_frames
+                loop_timings.append(completed_at - loop_started)
+                continue
             display_started = time.perf_counter()
             if args.preview_scale < 1.0:
                 preview_frame = cv2.resize(
@@ -1174,6 +1255,9 @@ def main() -> None:
             if key in (ord("q"), 27):
                 break
             loop_timings.append(time.perf_counter() - loop_started)
+    except KeyboardInterrupt:
+        session_ended = time.perf_counter()
+        print("Stopping on Ctrl+C...", flush=True)
     finally:
         capture_stats = async_capture.stats if async_capture is not None else CaptureStats(
             count=processed_frames,
@@ -1184,7 +1268,8 @@ def main() -> None:
             async_capture.close()
         if detector_worker is not None:
             detector_worker.close()
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
     session_duration = max(0.0, session_ended - session_started)
     capture_duration = (
         capture_stats.latest_captured_at - capture_stats.first_captured_at
@@ -1206,6 +1291,17 @@ def main() -> None:
         f"dropped={skipped_frames} ({drop_percentage:.1f}%)",
         flush=True,
     )
+    if args.headless:
+        print(
+            "Headless pose output: "
+            f"all={rate(pose_output_frames, session_duration):.1f} FPS "
+            f"(n={pose_output_frames}), "
+            f"steady={rate(steady_pose_output_frames, steady_duration):.1f} FPS "
+            f"(n={steady_pose_output_frames}), "
+            f"crop pose latency p50/p95={percentile_ms(session_pose_timings, 50)}/"
+            f"{percentile_ms(session_pose_timings, 95)} ms",
+            flush=True,
+        )
     print(
         "Session freshness (all): "
         f"age p50={percentile_ms(session_frame_ages, 50)} ms, "
