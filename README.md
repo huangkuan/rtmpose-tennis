@@ -66,14 +66,14 @@ For repeatable debugging with a recorded clip:
 PYTORCH_ENABLE_MPS_FALLBACK=1 python -m rtmpose_tennis.app \
   --video "./data/input/kid.mp4" \
   --realtime-video \
+  --headless \
   --device mps \
   --detector-device cpu \
   --model small \
-  --detector-interval 30 \
+  --detector-interval-seconds 1.0 \
   --async-detector \
   --crop-margin 0.35 \
-  --tracking-alpha 0.5 \
-  --preview-scale 0.5
+  --tracking-alpha 0.5
 ```
 
 Local videos are intentionally excluded from version control. Place debugging
