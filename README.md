@@ -91,7 +91,7 @@ thread and retain only its newest frame:
 PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
   --camera 0 --async-camera \
   --device mps --detector-device cpu \
-  --model small --detector-interval 30 --async-detector --crop-margin 0.35 \
+  --model small --detector-interval-seconds 1.0 --async-detector --crop-margin 0.35 \
   --tracking-alpha 0.35 --preview-scale 0.5
 ```
 
@@ -102,7 +102,7 @@ at its encoded frame rate:
 PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
   --video "./data/input/wnn.mp4" --realtime-video \
   --device mps --detector-device cpu \
-  --model small --detector-interval 30 --async-detector --crop-margin 0.35 \
+  --model small --detector-interval-seconds 1.0 --async-detector --crop-margin 0.35 \
   --tracking-alpha 0.35 --preview-scale 0.5
 ```
 
@@ -138,7 +138,7 @@ performance measurements:
 PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
   --video "./data/input/pro.mov" --realtime-video \
   --device mps --detector-device cpu --model small \
-  --detector-interval 30 --async-detector \
+  --detector-interval-seconds 1.0 --async-detector \
   --crop-margin 0.35 --tracking-alpha 0.5 --headless
 ```
 
@@ -147,6 +147,13 @@ detailed summary at shutdown. Change the live reporting cadence with
 `--status-interval SECONDS`. `pose output` counts successful pose samples, not
 preview frames or inference attempts. Stop a headless camera session with
 Ctrl+C; shutdown remains clean and prints the final metrics.
+
+`--detector-interval-seconds 1.0` is recommended for live and real-time
+simulation modes. It keeps routine RTMDet refreshes at a stable wall-clock rate
+when camera FPS or processing throughput changes. Recovery caused by a missing
+crop, low-confidence pose, or actionable crop edge remains immediate. The
+legacy `--detector-interval N` frame-based schedule remains available for
+repeatable comparisons; the two interval options are mutually exclusive.
 
 Useful options:
 

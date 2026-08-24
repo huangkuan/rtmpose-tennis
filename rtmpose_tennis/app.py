@@ -743,6 +743,13 @@ def parse_args() -> argparse.Namespace:
         help="Detect the player every N frames and run pose on the tracked crop between (0: disabled)",
     )
     parser.add_argument(
+        "--detector-interval-seconds",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Detect periodically by elapsed time instead of processed frames (0: disabled)",
+    )
+    parser.add_argument(
         "--async-detector",
         action="store_true",
         help="Run periodic RTMDet refreshes in a single-flight background worker",
@@ -805,14 +812,21 @@ def parse_args() -> argparse.Namespace:
         parser.error("--whole-image cannot be combined with --det-model")
     if args.detector_interval < 0:
         parser.error("--detector-interval cannot be negative")
-    if args.detector_interval and args.whole_image:
-        parser.error("--detector-interval cannot be combined with --whole-image")
-    if args.detector_interval and args.det_model:
-        parser.error("--detector-interval cannot currently be combined with --det-model")
-    if args.detector_device and not args.detector_interval:
-        parser.error("--detector-device requires --detector-interval")
-    if args.async_detector and not args.detector_interval:
-        parser.error("--async-detector requires --detector-interval")
+    if args.detector_interval_seconds < 0:
+        parser.error("--detector-interval-seconds cannot be negative")
+    if args.detector_interval and args.detector_interval_seconds:
+        parser.error(
+            "--detector-interval and --detector-interval-seconds cannot be combined"
+        )
+    hybrid_enabled = bool(args.detector_interval or args.detector_interval_seconds)
+    if hybrid_enabled and args.whole_image:
+        parser.error("detector intervals cannot be combined with --whole-image")
+    if hybrid_enabled and args.det_model:
+        parser.error("detector intervals cannot currently be combined with --det-model")
+    if args.detector_device and not hybrid_enabled:
+        parser.error("--detector-device requires a detector interval")
+    if args.async_detector and not hybrid_enabled:
+        parser.error("--async-detector requires a detector interval")
     if not 0 <= args.detector_score_threshold <= 1:
         parser.error("--detector-score-threshold must be between 0 and 1")
     if args.crop_margin < 0:
@@ -832,14 +846,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    hybrid_enabled = bool(args.detector_interval or args.detector_interval_seconds)
     pose_model_name = POSE_MODEL_PRESETS.get(args.model, args.model)
     base_kwargs: dict[str, Any] = {"pose2d": pose_model_name, "device": args.device}
-    if args.detector_interval:
+    if hybrid_enabled:
         detector_device = args.detector_device or ("cpu" if args.device == "mps" else args.device)
+        schedule = (
+            f"detect every {args.detector_interval_seconds:g} seconds"
+            if args.detector_interval_seconds
+            else f"detect every {args.detector_interval} processed frames"
+        )
         mode = (
             f"hybrid tracking (pose={args.device or 'auto'}, "
             f"detector={detector_device or 'auto'}, "
-            f"detect every {args.detector_interval} frames"
+            f"{schedule}"
             f"{' asynchronously' if args.async_detector else ''})"
         )
     elif args.whole_image:
@@ -851,7 +871,7 @@ def main() -> None:
         f"infer every {args.infer_every} frame(s)...",
         flush=True,
     )
-    if args.detector_interval:
+    if hybrid_enabled:
         print(f"Loading detector-only model '{args.detector_model}'...", flush=True)
         detector_inferencer = DetInferencer(
             model=args.detector_model,
@@ -912,6 +932,7 @@ def main() -> None:
     player: PlayerPose | None = None
     player_crop: tuple[int, int, int, int] | None = None
     last_detection_frame = -args.detector_interval
+    last_detection_at = float("-inf")
     redetection_reason: str | None = None
     detector_worker = (
         LatestDetectorWorker(detector_inferencer)
@@ -1000,12 +1021,22 @@ def main() -> None:
                 session_inference_waits.append(inference_wait)
                 if inference_started >= warmup_ends:
                     steady_inference_waits.append(inference_wait)
-                if args.detector_interval:
+                if hybrid_enabled:
+                    detection_now = time.perf_counter()
                     if player_crop is None:
                         detection_reason = "missing_crop"
                     elif redetection_reason is not None:
                         detection_reason = redetection_reason
-                    elif frame_index - last_detection_frame >= args.detector_interval:
+                    elif (
+                        args.detector_interval_seconds
+                        and detection_now - last_detection_at
+                        >= args.detector_interval_seconds
+                    ):
+                        detection_reason = "scheduled_interval"
+                    elif (
+                        args.detector_interval
+                        and frame_index - last_detection_frame >= args.detector_interval
+                    ):
                         detection_reason = "scheduled_interval"
                     else:
                         detection_reason = None
@@ -1027,6 +1058,7 @@ def main() -> None:
                                     steady_detector_refreshes += 1
                                     steady_detector_reason_counts[detection_reason] += 1
                                 last_detection_frame = frame_index
+                                last_detection_at = detection_now
                         else:
                             frame_stage = "detector"
                             detector_refreshes += 1
@@ -1051,6 +1083,7 @@ def main() -> None:
                                 player_crop = detected_crop
                                 redetection_reason = None
                             last_detection_frame = frame_index
+                            last_detection_at = detection_now
                     if player_crop is not None:
                         if frame_stage != "detector":
                             frame_stage = "pose"
@@ -1331,7 +1364,7 @@ def main() -> None:
         f"(n={len(steady_detector_ages)}, refreshes={steady_detector_refreshes})",
         flush=True,
     )
-    if args.detector_interval:
+    if hybrid_enabled:
         if detector_worker is not None:
             print(
                 "Background detector: "

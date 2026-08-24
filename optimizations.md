@@ -512,3 +512,35 @@ available for landmark-quality and crop-stability inspection. The next
 benchmark should compare preview and headless runs on the five-video suite,
 with special attention to pose-output FPS and capture-to-pose age on the
 58.6 FPS `pro.mov` source.
+
+### 17. Time-based scheduled redetection
+
+Headless `pro.mov` reached 53.7 successful pose outputs per second, exposing a
+rate-dependent behavior in `--detector-interval 30`: the same setting scheduled
+RTMDet about once per second at 30 processed FPS but about every 0.56 seconds at
+53.7 FPS. Faster processing therefore caused more detector contention even
+though tracking had not become less reliable.
+
+`--detector-interval-seconds` now provides a wall-clock schedule independent of
+source FPS, dropped frames, preview mode, and device speed. A value of `1.0`
+preserves the original intended refresh cadence on 30 FPS input. Any successful
+submission, whether scheduled or recovery-driven, resets the elapsed-time
+schedule. Missing-crop, missing-pose, low-keypoint, and actionable crop-edge
+recovery still request RTMDet immediately.
+
+The original frame-based option remains supported for compatibility and
+controlled comparisons, but it cannot be combined with the seconds option.
+Production-oriented benchmarks should now use:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
+  --video "./data/input/pro.mov" --realtime-video --headless \
+  --device mps --detector-device cpu --model small \
+  --detector-interval-seconds 1.0 --async-detector \
+  --crop-margin 0.35 --tracking-alpha 0.5
+```
+
+The next validation compares this run with the 53.7 FPS frame-scheduled
+headless baseline. Scheduled refreshes should fall from approximately 11 to
+seven or eight during the 7.6-second steady window, while recovery refreshes
+remain data-driven.
