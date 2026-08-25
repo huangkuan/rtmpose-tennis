@@ -508,10 +508,30 @@ produce the complete session summary, including background-detector metrics.
 
 This mode establishes the production-relevant compute ceiling without spending
 roughly 13 ms per frame on debugging visuals. The graphical path remains
-available for landmark-quality and crop-stability inspection. The next
-benchmark should compare preview and headless runs on the five-video suite,
-with special attention to pose-output FPS and capture-to-pose age on the
-58.6 FPS `pro.mov` source.
+available for landmark-quality and crop-stability inspection.
+
+#### Headless validation
+
+`backview.mp4` demonstrated the latency benefit on a 30 FPS source. Throughput
+was already source-limited, moving only from 29.8 to 30.0 FPS, but steady frame
+age p50/p95 fell from 31.1/56.9 ms to 17.7/32.8 ms. Inference-wait p95 fell
+from 23.2 to 0.3 ms, dropped frames declined from 1.4% to 0.9%, and every one of
+the 1,426 steady processed frames produced a valid pose.
+
+`pro.mov` exposed the actual compute gain because its source rate is 58.6 FPS:
+
+| Metric | Preview | Headless | Change |
+|---|---:|---:|---:|
+| Steady pose/processed FPS | 31.3 | 53.7 | +71.6% |
+| Dropped frames | 48.1% | 12.3% | -35.8 points |
+| Steady age p50 | 40.6 ms | 21.5 ms | -47.0% |
+| Steady age p95 | 51.3 ms | 36.4 ms | -29.0% |
+| Steady maximum age | 75.0 ms | 58.0 ms | -22.7% |
+
+The headless crop-pose model ran at 16.0/25.5 ms p50/p95. After startup crop
+acquisition, all 406 steady processed frames produced valid poses. This
+confirmed that preview rendering—not RTMPose—had become the dominant serial
+cost after background detection was introduced.
 
 ### 17. Time-based scheduled redetection
 
@@ -540,7 +560,35 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 rtmpose-tennis \
   --crop-margin 0.35 --tracking-alpha 0.5
 ```
 
-The next validation compares this run with the 53.7 FPS frame-scheduled
-headless baseline. Scheduled refreshes should fall from approximately 11 to
-seven or eight during the 7.6-second steady window, while recovery refreshes
-remain data-driven.
+#### Time-based validation
+
+On `pro.mov`, replacing the 30-frame schedule with a one-second schedule
+reduced steady detector submissions from 15 to 10 and scheduled reasons from
+11 to five. Five additional crop-edge recoveries reset the elapsed-time clock,
+so fewer than one scheduled request per wall-clock second was necessary.
+
+| Metric | 30-frame schedule | 1-second schedule | Change |
+|---|---:|---:|---:|
+| Steady pose-output FPS | 53.7 | 55.0 | +2.4% |
+| Dropped frames | 12.3% | 10.4% | -1.9 points |
+| Steady age p50 | 21.5 ms | 16.4 ms | -23.7% |
+| Steady age p95 | 36.4 ms | 36.1 ms | stable |
+| Pose latency p95 | 25.5 ms | 23.7 ms | -7.1% |
+| Steady detector submissions | 15 | 10 | -33.3% |
+
+The resulting 55.0 successful pose samples per second represent about 94% of
+the 58.6 FPS source rate. Fourteen detector jobs were submitted during the full
+session and 13 results were consumed; the final job completed at end-of-file
+without a later frame on which to apply it.
+
+`kid.mp4` confirmed that the time schedule preserves the intended cadence on a
+30 FPS source. It reached 29.8 steady pose-output FPS, dropped 2.6% of frames,
+and produced valid poses on all 635 steady frames. Steady detector submissions
+remained 23, comprising 21 scheduled and two crop-edge requests—nearly
+identical to the former 30-frame behavior. Compared with its graphical run,
+frame-age p50/p95 improved from 31.7/60.6 ms to 17.6/44.6 ms.
+
+Its prolonged source-boundary condition also remained controlled: 53 of 59
+edge events were clamped-only and suppressed, despite a repeated streak of 57
+frames. This validates time-based scheduling across both 30 FPS and roughly
+60 FPS inputs without weakening data-driven recovery.
