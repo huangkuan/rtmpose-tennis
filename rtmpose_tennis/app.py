@@ -31,6 +31,9 @@ COCO_KEYPOINT_NAMES = (
     "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee",
     "right_knee", "left_ankle", "right_ankle",
 )
+COCO_TENNIS_RACKET_LABEL = 38
+LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
+LEFT_WRIST, RIGHT_WRIST = 9, 10
 
 
 @dataclass
@@ -64,6 +67,8 @@ class DetectorRequest:
     sequence: int
     requested_at: float
     reason: str
+    pose_keypoints: np.ndarray | None = None
+    pose_scores: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +93,179 @@ class RedetectionAssessment:
     edge_hits: tuple[EdgeHit, ...] = ()
     clamped_edges: tuple[str, ...] = ()
     clamped_only_suppressed: bool = False
+
+
+@dataclass(frozen=True)
+class HandednessSnapshot:
+    label: str
+    confidence: float
+    locked: bool
+    left_evidence: float
+    right_evidence: float
+    racket_observations: int
+    motion_observations: int
+
+
+class HandednessEstimator:
+    """Accumulate conservative racket and wrist-motion handedness evidence."""
+
+    def __init__(self, mode: str = "auto") -> None:
+        self._mode = mode
+        self._evidence = {"left": 0.0, "right": 0.0}
+        self._locked_label: str | None = mode if mode in ("left", "right") else None
+        self._previous_keypoints: np.ndarray | None = None
+        self._previous_scores: np.ndarray | None = None
+        self._previous_at: float | None = None
+        self._last_motion_vote_at = float("-inf")
+        self.racket_observations = 0
+        self.motion_observations = 0
+
+    @staticmethod
+    def _point_box_distance(point: np.ndarray, box: np.ndarray) -> float:
+        dx = max(float(box[0] - point[0]), 0.0, float(point[0] - box[2]))
+        dy = max(float(box[1] - point[1]), 0.0, float(point[1] - box[3]))
+        return float(np.hypot(dx, dy))
+
+    def _add_evidence(self, side: str, weight: float) -> None:
+        if self._mode != "auto" or self._locked_label is not None or weight <= 0:
+            return
+        self._evidence[side] += weight
+        total = self._evidence["left"] + self._evidence["right"]
+        winner = max(self._evidence, key=self._evidence.get)
+        share = self._evidence[winner] / max(total, 1e-6)
+        if total >= 10.0 and share >= 0.82:
+            self._locked_label = winner
+
+    def observe_detector(
+        self,
+        result: dict[str, Any],
+        keypoints: np.ndarray | None,
+        scores: np.ndarray | None,
+        score_threshold: float,
+    ) -> None:
+        if self._mode != "auto" or keypoints is None or scores is None:
+            return
+        if len(keypoints) <= RIGHT_WRIST or len(scores) <= RIGHT_WRIST:
+            return
+        required = (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_WRIST, RIGHT_WRIST)
+        if any(float(scores[index]) < score_threshold for index in required):
+            return
+        shoulder_width = float(
+            np.linalg.norm(keypoints[LEFT_SHOULDER] - keypoints[RIGHT_SHOULDER])
+        )
+        if shoulder_width < 5.0:
+            return
+        predictions = result.get("predictions", [])
+        if not predictions:
+            return
+        prediction = predictions[0]
+        boxes = np.asarray(prediction.get("bboxes", []), dtype=np.float32).reshape(-1, 4)
+        detector_scores = np.asarray(prediction.get("scores", []), dtype=np.float32).reshape(-1)
+        labels = np.asarray(prediction.get("labels", []), dtype=np.int64).reshape(-1)
+        best: tuple[float, str, float] | None = None
+        for box, detector_score, label in zip(boxes, detector_scores, labels):
+            if label != COCO_TENNIS_RACKET_LABEL or detector_score < 0.2:
+                continue
+            left_distance = self._point_box_distance(keypoints[LEFT_WRIST], box)
+            right_distance = self._point_box_distance(keypoints[RIGHT_WRIST], box)
+            nearest = min(left_distance, right_distance)
+            separation = abs(left_distance - right_distance)
+            if nearest > 2.0 * shoulder_width or separation < 0.2 * shoulder_width:
+                continue
+            side = "left" if left_distance < right_distance else "right"
+            rank = float(detector_score) * separation / shoulder_width
+            if best is None or rank > best[0]:
+                best = (rank, side, float(detector_score))
+        if best is None:
+            return
+        rank, side, detector_score = best
+        self.racket_observations += 1
+        self._add_evidence(side, detector_score * min(2.0, rank))
+
+    def observe_pose(
+        self,
+        player: PlayerPose | None,
+        captured_at: float,
+        score_threshold: float,
+    ) -> None:
+        if self._mode != "auto" or player is None:
+            self._previous_keypoints = None
+            self._previous_scores = None
+            self._previous_at = None
+            return
+        keypoints = player.keypoints
+        scores = player.scores
+        previous_keypoints = self._previous_keypoints
+        previous_scores = self._previous_scores
+        previous_at = self._previous_at
+        self._previous_keypoints = keypoints.copy()
+        self._previous_scores = scores.copy()
+        self._previous_at = captured_at
+        if previous_keypoints is None or previous_scores is None or previous_at is None:
+            return
+        dt = captured_at - previous_at
+        required = (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_WRIST, RIGHT_WRIST)
+        if dt <= 0 or dt > 0.25 or any(
+            min(float(scores[index]), float(previous_scores[index])) < score_threshold
+            for index in required
+        ):
+            return
+        shoulder_width = float(
+            np.linalg.norm(keypoints[LEFT_SHOULDER] - keypoints[RIGHT_SHOULDER])
+        )
+        if shoulder_width < 5.0:
+            return
+        left_speed = float(
+            np.linalg.norm(keypoints[LEFT_WRIST] - previous_keypoints[LEFT_WRIST])
+        ) / (dt * shoulder_width)
+        right_speed = float(
+            np.linalg.norm(keypoints[RIGHT_WRIST] - previous_keypoints[RIGHT_WRIST])
+        ) / (dt * shoulder_width)
+        faster = max(left_speed, right_speed)
+        slower = min(left_speed, right_speed)
+        ratio = faster / max(slower, 0.25)
+        if (
+            faster < 1.5
+            or ratio < 1.4
+            or captured_at - self._last_motion_vote_at < 0.25
+        ):
+            return
+        side = "left" if left_speed > right_speed else "right"
+        confidence = min(float(scores[LEFT_WRIST]), float(scores[RIGHT_WRIST]))
+        weight = confidence * min(0.15, 0.05 + 0.05 * (ratio - 1.4))
+        self.motion_observations += 1
+        self._last_motion_vote_at = captured_at
+        self._add_evidence(side, weight)
+
+    @property
+    def snapshot(self) -> HandednessSnapshot:
+        if self._mode in ("left", "right"):
+            return HandednessSnapshot(
+                self._mode, 1.0, True,
+                1.0 if self._mode == "left" else 0.0,
+                1.0 if self._mode == "right" else 0.0,
+                self.racket_observations, self.motion_observations,
+            )
+        total = self._evidence["left"] + self._evidence["right"]
+        winner = max(self._evidence, key=self._evidence.get)
+        evidence_share = self._evidence[winner] / total if total > 0 else 0.0
+        label = self._locked_label or (
+            winner if total >= 4.0 and evidence_share >= 0.67 else "unknown"
+        )
+        confidence = (
+            evidence_share
+            if label != "unknown"
+            else evidence_share * min(1.0, total / 4.0)
+        )
+        return HandednessSnapshot(
+            label=label,
+            confidence=confidence,
+            locked=self._locked_label is not None,
+            left_evidence=self._evidence["left"],
+            right_evidence=self._evidence["right"],
+            racket_observations=self.racket_observations,
+            motion_observations=self.motion_observations,
+        )
 
 
 @dataclass
@@ -428,6 +606,7 @@ def draw_player(
     player: PlayerPose | None,
     threshold: float,
     visual_scale: float = 1.0,
+    dominant_hand: str = "unknown",
 ) -> np.ndarray:
     canvas = frame.copy()
     if player is None:
@@ -438,10 +617,15 @@ def draw_player(
             p1 = tuple(np.rint(player.keypoints[start]).astype(int))
             p2 = tuple(np.rint(player.keypoints[end]).astype(int))
             cv2.line(canvas, p1, p2, (0, 220, 255), max(1, round(3 * visual_scale)), cv2.LINE_AA)
-    for point, is_visible in zip(player.keypoints, visible):
+    dominant_wrist = {
+        "left": LEFT_WRIST,
+        "right": RIGHT_WRIST,
+    }.get(dominant_hand)
+    for index, (point, is_visible) in enumerate(zip(player.keypoints, visible)):
         if is_visible:
+            color = (40, 230, 40) if index == dominant_wrist else (40, 40, 255)
             cv2.circle(canvas, tuple(np.rint(point).astype(int)), max(2, round(5 * visual_scale)),
-                       (40, 40, 255), -1, cv2.LINE_AA)
+                       color, -1, cv2.LINE_AA)
     if player.bbox is not None:
         x1, y1, x2, y2 = np.rint(player.bbox).astype(int)
         cv2.rectangle(canvas, (x1, y1), (x2, y2), (80, 230, 80),
@@ -780,6 +964,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--score-threshold", type=float, default=0.3)
     parser.add_argument(
+        "--handedness",
+        choices=("auto", "left", "right"),
+        default="auto",
+        help="Player handedness or automatic temporal inference (default: auto)",
+    )
+    parser.add_argument(
         "--preview-scale",
         type=float,
         default=1.0,
@@ -847,6 +1037,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     hybrid_enabled = bool(args.detector_interval or args.detector_interval_seconds)
+    handedness_estimator = HandednessEstimator(args.handedness)
     pose_model_name = POSE_MODEL_PRESETS.get(args.model, args.model)
     base_kwargs: dict[str, Any] = {"pose2d": pose_model_name, "device": args.device}
     if hybrid_enabled:
@@ -896,6 +1087,7 @@ def main() -> None:
     detector_timings: deque[float] = deque(maxlen=20)
     pose_timings: deque[float] = deque(maxlen=60)
     session_pose_timings: list[float] = []
+    handedness_timings: list[float] = []
     display_timings: deque[float] = deque(maxlen=60)
     loop_timings: deque[float] = deque(maxlen=60)
     inference_wait_timings: deque[float] = deque(maxlen=120)
@@ -991,6 +1183,14 @@ def main() -> None:
                         steady_detector_results_completed += 1
                         steady_detector_result_latencies.append(result_latency)
                         steady_detector_result_lags.append(result_lag)
+                    handedness_started = time.perf_counter()
+                    handedness_estimator.observe_detector(
+                        completed_detection.prediction,
+                        completed_detection.request.pose_keypoints,
+                        completed_detection.request.pose_scores,
+                        args.score_threshold,
+                    )
+                    handedness_timings.append(time.perf_counter() - handedness_started)
                     player_bbox = select_player_bbox(
                         completed_detection.prediction,
                         completed_detection.request.frame_shape,
@@ -1050,6 +1250,12 @@ def main() -> None:
                                 sequence=packet.sequence,
                                 requested_at=time.perf_counter(),
                                 reason=detection_reason,
+                                pose_keypoints=(
+                                    player.keypoints.copy() if player is not None else None
+                                ),
+                                pose_scores=(
+                                    player.scores.copy() if player is not None else None
+                                ),
                             ))
                             if accepted:
                                 detector_refreshes += 1
@@ -1069,6 +1275,16 @@ def main() -> None:
                             detector_started = time.perf_counter()
                             detection_result = detector_inferencer(frame, return_vis=False)
                             detector_timings.append(time.perf_counter() - detector_started)
+                            handedness_started = time.perf_counter()
+                            handedness_estimator.observe_detector(
+                                detection_result,
+                                player.keypoints if player is not None else None,
+                                player.scores if player is not None else None,
+                                args.score_threshold,
+                            )
+                            handedness_timings.append(
+                                time.perf_counter() - handedness_started
+                            )
                             player_bbox = select_player_bbox(
                                 detection_result,
                                 frame.shape,
@@ -1144,6 +1360,13 @@ def main() -> None:
                     else:
                         detector_timings.append(stage_seconds)
                     player = select_player(result, frame.shape)
+                handedness_started = time.perf_counter()
+                handedness_estimator.observe_pose(
+                    player,
+                    packet.captured_at,
+                    args.score_threshold,
+                )
+                handedness_timings.append(time.perf_counter() - handedness_started)
                 inference_timings.append(time.perf_counter() - inference_started)
                 if player is not None:
                     pose_output_frames += 1
@@ -1183,6 +1406,7 @@ def main() -> None:
                         dropped_frames,
                         captured_so_far - processed_frames,
                     )
+                    status_handedness = handedness_estimator.snapshot
                     print(
                         "Headless status: "
                         f"pose output={rate(interval_pose_outputs, interval_duration):.1f} FPS, "
@@ -1190,6 +1414,8 @@ def main() -> None:
                         f"age p50/p95={percentile_ms(frame_age_timings, 50)}/"
                         f"{percentile_ms(frame_age_timings, 95)} ms, "
                         f"pose={average_ms(pose_timings)} ms, "
+                        f"hand={status_handedness.label} "
+                        f"({status_handedness.confidence:.0%}), "
                         f"dropped={100.0 * skipped_so_far / max(captured_so_far, 1):.1f}%",
                         flush=True,
                     )
@@ -1207,11 +1433,13 @@ def main() -> None:
             else:
                 preview_frame = frame
                 preview_player = player
+            handedness = handedness_estimator.snapshot
             canvas = draw_player(
                 preview_frame,
                 preview_player,
                 args.score_threshold,
                 visual_scale=args.preview_scale,
+                dominant_hand=handedness.label,
             )
             model_fps = len(inference_timings) / max(sum(inference_timings), 1e-6)
             display_fps = len(loop_timings) / max(sum(loop_timings), 1e-6) if loop_timings else 0.0
@@ -1226,7 +1454,9 @@ def main() -> None:
             text_thickness = max(1, round(2 * args.preview_scale))
             cv2.putText(
                 canvas,
-                f"{status} | model {model_fps:.1f} | output {display_fps:.1f} FPS | Q",
+                f"{status} | hand {handedness.label} {handedness.confidence:.0%} | "
+                f"model {model_fps:.1f} | "
+                f"output {display_fps:.1f} FPS | Q",
                 (text_x, main_y), cv2.FONT_HERSHEY_SIMPLEX, main_font,
                 (40, 240, 40), text_thickness, cv2.LINE_AA,
             )
@@ -1362,6 +1592,19 @@ def main() -> None:
         f"detector age p50/p95={percentile_ms(steady_detector_ages, 50)}/"
         f"{percentile_ms(steady_detector_ages, 95)} ms "
         f"(n={len(steady_detector_ages)}, refreshes={steady_detector_refreshes})",
+        flush=True,
+    )
+    handedness = handedness_estimator.snapshot
+    print(
+        "Handedness: "
+        f"prediction={handedness.label}, confidence={handedness.confidence:.1%}, "
+        f"locked={'yes' if handedness.locked else 'no'}, "
+        f"evidence left/right={handedness.left_evidence:.2f}/"
+        f"{handedness.right_evidence:.2f}, "
+        f"racket observations={handedness.racket_observations}, "
+        f"motion observations={handedness.motion_observations}, "
+        f"overhead p50/p95={percentile_ms(handedness_timings, 50)}/"
+        f"{percentile_ms(handedness_timings, 95)} ms",
         flush=True,
     )
     if hybrid_enabled:

@@ -592,3 +592,38 @@ Its prolonged source-boundary condition also remained controlled: 53 of 59
 edge events were clamped-only and suppressed, despite a repeated streak of 57
 frames. This validates time-based scheduling across both 30 FPS and roughly
 60 FPS inputs without weakening data-driven recovery.
+
+### 18. Temporal handedness inference
+
+Gesture features need a stable definition of the racket side so left-handed
+poses can be canonicalized before stroke classification. `--handedness auto`
+now maintains a conservative temporal evidence state rather than classifying a
+single ambiguous frame. Manual `left` and `right` modes provide deterministic
+overrides for known players and evaluation.
+
+The primary signal reuses COCO tennis-racket detections already produced by
+periodic RTMDet. A racket box is associated with the nearest confident
+anatomical wrist from the pose captured when that detector request was
+submitted. Observations are rejected when the racket is too far from both
+wrists or when the left/right distance difference is ambiguous. This adds no
+neural-network inference and does not increase detector frequency.
+
+A lower-weight secondary signal compares shoulder-width-normalized left and
+right wrist velocities. It votes only during sufficiently fast, asymmetric
+motion and is rate-limited to avoid counting every frame of the same movement.
+This helps when the thin or motion-blurred racket is not detected, while
+limiting the influence of toss-arm movement and two-handed backhands.
+
+Automatic output begins as `unknown`. A provisional side requires at least
+four weighted evidence units and a 67% winning share. The decision locks only
+after at least ten evidence units with an 82% share. Runtime and final metrics
+report the label, confidence, lock state, left/right evidence, racket and
+motion observation counts, and estimator overhead p50/p95. Synthetic unit and
+headless integration tests measured overhead below the displayed 0.1 ms
+resolution, so no meaningful throughput impact is expected.
+
+Real-video validation should check known left- and right-handed players across
+forehands, serves, one- and two-handed backhands, motion blur, and rear/side
+views. Accuracy and time-to-decision are now more important than further FPS
+optimization; uncertain sessions should remain `unknown` rather than forcing
+an incorrect coaching orientation.

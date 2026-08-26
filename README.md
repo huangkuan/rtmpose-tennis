@@ -155,12 +155,24 @@ crop, low-confidence pose, or actionable crop edge remains immediate. The
 legacy `--detector-interval N` frame-based schedule remains available for
 repeatable comparisons; the two interval options are mutually exclusive.
 
+Automatic handedness inference is enabled by default with `--handedness auto`.
+It accumulates conservative evidence across time from tennis-racket boxes
+already returned by RTMDet and from asymmetric high-speed wrist motion. The
+result remains `unknown` until sufficient evidence is available, then reports
+`left` or `right`, confidence, and whether the decision is locked. For known
+players or controlled tests, bypass inference with `--handedness left` or
+`--handedness right`. The terminal summary reports left/right evidence,
+racket and motion observation counts, and estimator overhead p50/p95.
+In preview mode, the dominant-side wrist landmark is green; other landmarks
+remain red. No wrist is highlighted while automatic handedness is `unknown`.
+
 Useful options:
 
 ```bash
 rtmpose-tennis --camera 1 --device cuda:0 --width 1280 --height 720
 rtmpose-tennis --video ./samples/forehand.mp4 --device cuda:0
 rtmpose-tennis --device cpu --score-threshold 0.4
+rtmpose-tennis --camera 0 --handedness right
 ```
 
 ## Performance tuning
