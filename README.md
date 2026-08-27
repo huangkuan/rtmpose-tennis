@@ -1,11 +1,5 @@
 # RTMPose tennis player prototype
 
-<!--
-开发流程约定（当前本地项目环境）：日常开发和所有代码/文档变更统一在
-`fuhai` 分支进行；完成后推送到 GitHub 创建 Pull Request，经审核合并到
-`main`。不要直接在 `main` 分支开发或直接推送到 `main`。
--->
-
 A first-stage real-time pipeline that reads a live camera or video file, detects people with
 the detector bundled with MMPose's `human` alias, estimates body keypoints using
 RTMPose-small, and displays the annotated video. When several people are visible, the
