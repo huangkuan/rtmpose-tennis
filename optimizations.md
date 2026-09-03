@@ -595,30 +595,23 @@ frames. This validates time-based scheduling across both 30 FPS and roughly
 
 ### 18. Temporal handedness inference
 
-Gesture features need a stable definition of the racket side so left-handed
+Gesture features need a stable definition of the dominant side so left-handed
 poses can be canonicalized before stroke classification. `--handedness auto`
 now maintains a conservative temporal evidence state rather than classifying a
 single ambiguous frame. Manual `left` and `right` modes provide deterministic
 overrides for known players and evaluation.
 
-The primary signal reuses COCO tennis-racket detections already produced by
-periodic RTMDet. A racket box is associated with the nearest confident
-anatomical wrist from the pose captured when that detector request was
-submitted. Observations are rejected when the racket is too far from both
-wrists or when the left/right distance difference is ambiguous. This adds no
-neural-network inference and does not increase detector frequency.
-
-A lower-weight secondary signal compares shoulder-width-normalized left and
-right wrist velocities. It votes only during sufficiently fast, asymmetric
-motion and is rate-limited to avoid counting every frame of the same movement.
-This helps when the thin or motion-blurred racket is not detected, while
-limiting the influence of toss-arm movement and two-handed backhands.
+The estimator compares shoulder-width-normalized left and right wrist
+velocities. It votes only during sufficiently fast, asymmetric motion and is
+rate-limited to avoid counting every frame of the same movement. Ambiguous
+motion does not vote, limiting the influence of toss-arm movement and
+two-handed backhands.
 
 Automatic output begins as `unknown`. A provisional side requires at least
 four weighted evidence units and a 67% winning share. The decision locks only
 after at least ten evidence units with an 82% share. Runtime and final metrics
-report the label, confidence, lock state, left/right evidence, racket and
-motion observation counts, and estimator overhead p50/p95. Synthetic unit and
+report the label, confidence, lock state, left/right evidence, motion
+observation counts, and estimator overhead p50/p95. Synthetic unit and
 headless integration tests measured overhead below the displayed 0.1 ms
 resolution, so no meaningful throughput impact is expected.
 
@@ -627,3 +620,266 @@ forehands, serves, one- and two-handed backhands, motion blur, and rear/side
 views. Accuracy and time-to-decision are now more important than further FPS
 optimization; uncertain sessions should remain `unknown` rather than forcing
 an incorrect coaching orientation.
+
+### 19. Timestamped normalized pose pipeline
+
+The first gesture-recognition foundation is now separated from video rendering
+and model inference. Every successful inferred pose can produce a
+`TemporalPoseFrame` containing the source sequence, capture timestamp,
+normalized keypoints, confidence scores, and derived `PoseFeatures`. A
+time-bounded `TemporalPoseBuffer` retains the latest two seconds by default,
+independent of whether the source is running at 30 or roughly 60 FPS.
+
+Normalization uses hip center as the origin, shoulder width as scale, the
+left-to-right shoulder line as the local horizontal axis, and its perpendicular
+directed toward the hips as the local vertical axis. This removes image
+translation, scale, and in-plane lean. When handedness is known to be left,
+coordinates are
+reflected and bilateral COCO joints are swapped so the dominant side occupies
+the canonical right-side indices. The buffer clears when canonical handedness
+changes, preventing mixed coordinate conventions in one temporal window.
+
+Current per-frame features include:
+
+- left, right, and dominant wrist velocity;
+- dominant wrist acceleration and local position;
+- dominant elbow angle and arm extension;
+- wrist separation and dominant-wrist midline crossing;
+- shoulder angle, hip angle, and their wrapped difference;
+- torso scale and mean landmark confidence.
+
+The optional `--pose-log PATH` writer records this interface as JSONL for
+offline plots, stroke segmentation, and labelled-dataset preparation. Logging
+is opt-in so production inference does not pay JSON serialization or disk-I/O
+cost. The terminal reports generated samples, current window size, feature
+extraction overhead, logged count, and logging overhead.
+
+Synthetic tests verify translation/scale body normalization, equivalence of
+mirrored left-handed and canonical right-handed poses, normalized velocity,
+time-window pruning, JSON schema, and full headless-loop integration. The next
+step is to log known right-handed forehand and backhand clips, visualize the
+dominant wrist trajectory and torso features, and define a generic swing
+candidate segment before assigning stroke labels.
+
+Four labelled clips now cover right- and left-handed forehands and backhands,
+plus recovery, volleys, a serve, and an overhead. The companion
+`rtmpose_tennis.annotations` tool validates ordered, non-overlapping intervals
+and joins them to a pose JSONL stream by timestamp. This establishes a
+repeatable ground-truth dataset without coupling labels or offline file I/O to
+the real-time inference loop.
+
+### 20. Offline event-recognition baseline
+
+`rtmpose_tennis.stroke_analysis` builds one robust feature vector per annotated
+event and evaluates a three-nearest-neighbor baseline using leave-one-video-out
+splits. Groundstroke forehands and backhands are separate classes; recovery,
+serve, overhead, and volleys are grouped as `other` for the first experiment.
+This avoids frame leakage and measures recognition only—the annotated event
+boundaries are supplied to the model, so automatic segmentation is not yet part
+of the score.
+
+The initial four-video baseline contains 72 events and scores 59/72 (81.9%).
+It recognizes 17/22 forehands and 37/39 `other` events, but only 5/11
+backhands. Per-video accuracy ranges from 66.7% on the left-handed mixed clip
+to 100% on the forehand-only clip. The result is useful as a reproducible
+starting point, not a production accuracy claim. Backhand recall and
+cross-player canonicalization should improve before live integration.
+
+Adding the first 51.3 seconds of the right-handed `baseline.mp4` session adds
+13 forehands and five backhands. The corrected five-video evaluation contains
+107 events and scores 86/107 (80.4%). It recognizes 24/35 forehands, 7/16
+backhands, and 55/56 `other` events. An earlier draft mistakenly represented a
+15.7-second region containing five forehands as one recovery event, which
+inflated accuracy to 83.5%; that result is obsolete. The corrected errors are
+dominated by forehand/backhand confusion, making robust temporal direction and
+pose-outlier handling the next feature-quality target.
+
+A second-pass review of the left-handed `mix.mp4` boundaries increases the
+dataset to 108 events and the score to 88/108 (81.5%). Forehand recognition is
+27/35, backhand recognition is 6/16, and `other` recognition is 55/57. The held
+out `mix.mp4` fold improves from 66.7% to 71.4%. Five of its seven groundstroke
+backhands are still classified as `other` and one as forehand, confirming that
+backhand trajectory representation—not merely annotation noise—is the leading
+model weakness.
+
+Reviewing the right-handed `wnn.mp4` boundaries increases the inventory to 109
+events and improves the baseline to 91/109 (83.5%). Its held-out fold improves
+from 81.0% to 86.4%, while aggregate backhand recognition improves from 6/16
+to 9/16. The remaining `wnn.mp4` errors are its opening forehand classified as
+`other`, one backhand classified as forehand, and the verified 30.83–31.61
+recovery tail classified as forehand.
+
+Extending verified `baseline.mp4` labels through 72.25 seconds adds four
+forehands, two backhands, and five recovery events. An explicitly uncertain
+60.04–65.04 interval is labelled `unknown` and excluded from classifier training
+and evaluation. The benchmark now contains 120 events and scores 101/120
+(84.2%): 29/39 forehands, 11/18 backhands, and 61/63 `other` events. The held-out
+`baseline.mp4` fold scores 38/46 (82.6%).
+
+### 21. Confidence-aware temporal stroke features
+
+The second offline feature path rejects low-confidence or implausible joint
+coordinates, interpolates the remaining dominant wrist, elbow, shoulder, and
+non-dominant wrist observations onto 21 normalized time points, applies a short
+median/weighted smoother, and retains seven ordered swing phases. It derives
+motion direction, speed, extension, elbow angle, wrist separation, peak timing,
+and start-to-end displacement from the repaired trajectory.
+
+Smoothed features alone also score 101/120 (84.2%), but materially change the
+error distribution: backhand recognition improves from 11/18 to 14/18 and
+direct forehand/backhand confusion drops from nine events to three, while ten
+forehands are rejected as `other`. A hierarchical design therefore uses the
+aggregate representation as a groundstroke gate and the temporal
+representation only for forehand/backhand direction.
+
+To avoid choosing neighbor counts on the test video, each outer held-out-video
+fold performs an inner leave-one-video-out search using only its four training
+videos. This nested hierarchical evaluation scores 104/120 (86.7%): 29/39
+forehands, 14/18 backhands, and 61/63 `other` events. The original aggregate
+method remains available with `--method aggregate`, and the temporal-only
+comparison with `--method smoothed`. This is an offline recognition result with
+known event boundaries and has no impact on live inference FPS.
+
+### 22. Offline automatic stroke-boundary proposals
+
+`rtmpose_tennis.stroke_segmentation` evaluates the first continuous-stream
+event detector independently of stroke recognition. It confidence-filters and
+interpolates the canonical dominant-wrist trajectory, applies time-based median
+and mean smoothing, converts velocity to a compressed motion-energy signal,
+selects separated local peaks, and places preparation/follow-through windows
+around them. Forehands, backhands, volleys, serves, and overheads are all stroke
+events; recovery is negative footage, while explicit `unknown` and unlabeled
+regions are outside evaluation.
+
+Each outer held-out-video fold selects its threshold quantile, peak separation,
+maximum search window, and low-motion boundary quantile using only the other
+four videos. The adaptive detector searches backward from the peak for motion
+onset and forward for deceleration, retaining a short context pad. At interval
+IoU 0.30, it matches 60/61 strokes from 64 proposals: 93.8% precision, 98.4%
+recall, and 96.0% F1. Mean matched IoU improves to 0.695, with mean absolute
+start/end errors of 267/265 ms. The earlier fixed-window result was 93.7% F1,
+0.633 IoU, and 427/300 ms errors.
+
+This remains an offline segmentation result and does not yet combine proposal
+classification, confidence-based rejection, or live feedback latency. It adds
+no work to the real-time application until explicitly integrated.
+
+### 23. Offline end-to-end stroke pipeline
+
+`rtmpose_tennis.stroke_pipeline` passes automatically generated intervals into
+the hierarchical recognizer. For every outer held-out video, segmentation and
+classifier settings are selected using only the other four videos. Proposal
+features are extracted from the predicted window rather than the verified
+annotation, making this the first measurement of compounded detection and
+recognition behavior.
+
+The first adaptive-window run still trained the recognizer on manually bounded
+events, producing only 39/61 correct and 62.4% end-to-end F1 because adaptive
+test windows had a different feature distribution. Training each outer-fold
+classifier on automatically proposed windows from its four training videos
+corrects that mismatch. Matched training proposals inherit their verified
+class; unmatched training proposals teach the groundstroke gate `other`.
+
+The proposal-shaped result correctly detects and classifies 45/61 strokes from
+64 proposals. End-to-end precision is 70.3%, recall is 73.8%, and F1 is 72.0%.
+Detection recall is 98.4%, matched-proposal classification is 75.0%, and
+unmatched proposals produce 1.49 false alerts per evaluated minute. Per-video
+correct counts are 15/24 for `baseline.mp4`, 4/6 for `kid.mp4`, 10/14 for
+`mix.mp4`, 6/6 for `pro.mov`, and 10/11 for `wnn.mp4`. At IoU 0.50, end-to-end
+F1 is 65.6% and matched-proposal classification is 82.0%.
+
+This remains offline and adds no work to the real-time application. The next
+decision is whether to improve cross-session proposal classification further or
+establish a streaming state-machine baseline with explicit decision latency.
+
+### 24. Peak-aligned classification experiment
+
+Automatic proposals now retain the timestamp of their dominant-wrist motion
+peak separately from their adaptive onset and deceleration boundaries. The
+offline pipeline can therefore continue using adaptive intervals for detection
+IoU and user-facing start/end times while extracting temporal classification
+features from a consistent peak-relative window. For every outer held-video
+fold, 16 windows from 0.45–0.90 seconds before and after the peak are evaluated
+using only the four training videos; neighbour counts are selected inside the
+same training-only process.
+
+The experiment did not improve the current dataset. Interval alignment remains
+at 45/61 correctly detected and classified strokes, 75.0% matched-proposal
+classification, and 72.0% end-to-end F1. Peak alignment produces 42/61,
+70.0%, and 67.2%, respectively. It improves `baseline.mp4` from 15/24 to 17/24
+correct but reduces `pro.mov` from 6/6 to 4/6, `wnn.mp4` from 10/11 to 8/11,
+and `mix.mp4` from 10/14 to 9/14.
+
+The likely limitation is semantic rather than computational: the largest 2D
+wrist-speed peak is not guaranteed to represent the same stroke phase across
+viewpoints and players. It may occur during acceleration, near contact, or in
+follow-through, and pose noise can move it further. Peak alignment is retained
+behind `--classifier-alignment peak` for reproducible comparison, while
+interval alignment stays the default and preserves the established baseline.
+
+### 25. Multi-anchor motion-phase classification
+
+The next temporal representation replaces the single-peak assumption with five
+anchors at 10%, 30%, 50%, 70%, and 90% of cumulative dominant-wrist motion.
+These anchors adapt to how motion is distributed within each automatically
+proposed interval. The classifier compares dominant and non-dominant wrist
+positions, wrist velocity and speed, arm extension, elbow angle, wrist
+separation, phase timing, and displacement between adjacent phases. Confidence
+filtering, trajectory repair, smoothing, handedness canonicalization, and
+training-video-only model selection remain unchanged.
+
+With verified event boundaries, the hierarchical held-video result improves
+from 104/120 (86.7%) to 111/120 (92.5%). Direct forehand/backhand confusion is
+eliminated in this test: 36/39 forehands and 14/18 backhands are correct, while
+61/63 `other` events remain correct.
+
+At the operational IoU 0.30 threshold with automatic proposals, correctly
+detected and classified strokes improve from 45/61 to 49/61. Matched-proposal
+classification rises from 75.0% to 81.7%, and end-to-end F1 rises from 72.0%
+to 78.4%; detection recall and unmatched false alerts remain 98.4% and 1.49 per
+minute because the proposal stage is unchanged. Results improve on
+`baseline.mp4` (15/24 to 17/24), `mix.mp4` (10/14 to 12/14), and `wnn.mp4`
+(10/11 to 11/11), stay 6/6 on `pro.mov`, and regress from 4/6 to 3/6 on
+`kid.mp4`.
+
+At strict IoU 0.50, the result is slightly lower than the former representation:
+40 versus 41 correctly detected and classified strokes, and 64.0% versus 65.6%
+F1. Motion phases are promoted as the operational IoU 0.30 default because of
+the larger cross-video classification improvement, while
+`--classifier-features smoothed` retains the previous representation for exact
+comparison. This feature extraction remains offline and does not affect live
+application FPS.
+
+### 26. Confidence-aware audit and abstention
+
+The end-to-end report now records every matched proposal, unmatched proposal,
+and missed stroke. Matched audit entries include the verified and predicted
+classes, IoU, dominant-wrist motion peak, five phase-anchor timestamps, mean
+pose confidence, nearest-class distances and votes for both classifier stages,
+and an explicit `groundstroke_gate` or `forehand_backhand` failure stage.
+Across the unfiltered benchmark, the 11 classification errors divide into six
+forehand/backhand errors and five groundstroke-gate errors; there are also four
+unmatched proposals and one missed stroke.
+
+A distance margin from either representation alone was not sufficiently
+calibrated. The selective rule therefore requires agreement between the
+motion-phase and uniformly sampled temporal classifiers, then applies their
+minimum nearest-class distance margin. Each outer fold selects its confidence
+threshold from only the other four videos, targeting at least 90% accepted
+accuracy while retaining as much training coverage as possible; the held-out
+video never selects its threshold.
+
+On the held-video benchmark, the rule accepts 40/60 matched proposals (66.7%
+coverage) and correctly classifies 37/40 (92.5%). None of the four unmatched
+proposals passes the confidence filter, reducing confident false alerts from
+1.49 to 0.00 per evaluated minute. Among accepted verified forehands and
+backhands, 37/38 are fully correct; the remaining forehand is rejected by the
+groundstroke gate as `other`, so there are no accepted direct
+forehand/backhand inversions in this small dataset.
+
+This is a selective safety metric, not a replacement for the unfiltered 78.4%
+end-to-end F1. Coverage varies materially by held-out video: 100% for `pro.mov`,
+72.7% for `wnn.mp4`, 84.6% for `mix.mp4`, 54.2% for `baseline.mp4`, and only
+33.3% for `kid.mp4`. The accepted `kid.mp4` subset is still just 1/2 correct,
+confirming that broader player and non-groundstroke training data are needed
+before real-time audible decisions.

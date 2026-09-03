@@ -156,15 +156,139 @@ legacy `--detector-interval N` frame-based schedule remains available for
 repeatable comparisons; the two interval options are mutually exclusive.
 
 Automatic handedness inference is enabled by default with `--handedness auto`.
-It accumulates conservative evidence across time from tennis-racket boxes
-already returned by RTMDet and from asymmetric high-speed wrist motion. The
-result remains `unknown` until sufficient evidence is available, then reports
-`left` or `right`, confidence, and whether the decision is locked. For known
-players or controlled tests, bypass inference with `--handedness left` or
-`--handedness right`. The terminal summary reports left/right evidence,
-racket and motion observation counts, and estimator overhead p50/p95.
+It accumulates conservative evidence from asymmetric high-speed wrist motion.
+The result remains `unknown` until sufficient evidence is available, then
+reports `left` or `right`, confidence, and whether the decision is locked. For
+known players or controlled tests, bypass inference with `--handedness left`
+or `--handedness right`. The terminal summary reports left/right evidence,
+motion observation counts, and estimator overhead p50/p95.
 In preview mode, the dominant-side wrist landmark is green; other landmarks
 remain red. No wrist is highlighted while automatic handedness is `unknown`.
+
+The gesture-recognition hand-off is a timestamped, body-normalized pose window.
+It retains the latest two seconds by default; change this with
+`--pose-buffer-seconds`. To inspect or label the resulting trajectory, write
+newline-delimited JSON with:
+
+```bash
+rtmpose-tennis \
+  --video "./data/input/pro.mov" --realtime-video --headless \
+  --handedness right --pose-log "./data/output/pro-pose.jsonl" \
+  --device mps --detector-device cpu --model small \
+  --detector-interval-seconds 1.0 --async-detector
+```
+
+Each JSONL record contains the source sequence and timestamp, 17 normalized
+COCO keypoints and confidence scores, wrist velocity and acceleration, elbow
+angle, arm extension, wrist separation, torso angles, and midline-crossing
+state. Left-handed poses are reflected and relabelled into the same canonical
+right-handed representation. Use a manual handedness value while preparing
+labelled data because automatic handedness is not yet validated sufficiently.
+`data/output/` is excluded from Git.
+
+Versioned stroke intervals live in `data/annotations/`. Join an annotation file
+to its pose log before classifier development with:
+
+```bash
+python -m rtmpose_tennis.annotations \
+  --pose-log ./data/output/pro-pose.jsonl \
+  --annotations ./data/annotations/pro.json \
+  --output ./data/output/pro-labeled.jsonl
+```
+
+The output adds `stroke_label` to every pose record while leaving source logs
+unchanged. Samples outside annotated intervals are marked `unlabeled`.
+Annotations currently cover right- and left-handed forehands, backhands,
+volleys, a serve, an overhead, and recovery periods.
+
+Run the first event-level recognition benchmark across every matched annotation
+and pose log with:
+
+```bash
+python -m rtmpose_tennis.stroke_analysis \
+  --pose-dir ./data/output \
+  --annotations ./data/annotations \
+  --report ./data/output/stroke-baseline.json
+```
+
+The default benchmark uses a two-stage classifier. Aggregate features first
+separate groundstrokes from `other`; confidence-repaired, smoothed, phase-aware
+features then separate forehands from backhands. Every test video remains
+untouched while neighbor counts are selected with inner leave-one-video-out
+validation. This prevents neighboring frames and test-video settings from
+leaking into training. Explicit `unknown` intervals are excluded.
+
+Use `--method aggregate` to reproduce the original baseline or `--method
+smoothed` to evaluate the temporal features alone. All methods assume known
+event boundaries; automatic stroke segmentation remains a separate next stage.
+
+Evaluate automatic stroke-boundary proposals from the continuous pose logs
+with:
+
+```bash
+python -m rtmpose_tennis.stroke_segmentation \
+  --pose-dir ./data/output \
+  --annotations ./data/annotations \
+  --report ./data/output/stroke-segmentation.json
+```
+
+The detector repairs and smooths the dominant-wrist trajectory, finds separated
+motion peaks, then searches backward for motion onset and forward for
+deceleration. It targets all labelled stroke types; `recovery` is negative
+footage and `unknown` or unlabeled footage is excluded. Parameters are selected
+using only the other videos for every held-out-video fold. Use `--boundary-mode
+fixed` for the original fixed-window comparison or `--selection fixed` to test
+explicit parameter values. Reported recognition accuracy and segmentation F1
+are separate metrics; they are not yet an end-to-end live score.
+
+Connect automatic proposals to the recognizer and evaluate the complete offline
+pipeline with:
+
+```bash
+python -m rtmpose_tennis.stroke_pipeline \
+  --pose-dir ./data/output \
+  --annotations ./data/annotations \
+  --report ./data/output/stroke-pipeline.json
+```
+
+Both segmentation and classifier settings are selected from training videos
+only before each held-out video is scored. End-to-end precision requires both a
+matched interval and the correct class. `false alerts/minute` counts only
+unmatched proposals; detected strokes assigned the wrong class are reported as
+classification errors instead. Training-video classifier examples use the same
+automatically proposed window shape as the held-out video, avoiding a mismatch
+between manually bounded training events and adaptive test proposals.
+
+The default temporal representation locates five cumulative dominant-wrist
+motion anchors spanning preparation through follow-through. It compares joint
+position, direction, extension, and timing at those phases instead of relying
+on one maximum-speed frame. Use `--classifier-features smoothed` to reproduce
+the earlier uniformly sampled temporal baseline.
+
+The JSON report also contains a per-proposal `audit` with detection IoU,
+groundstroke-gate and forehand/backhand decisions, nearest-class distances,
+pose confidence, phase-anchor timestamps, and the stage responsible for each
+error. A selective result compares the motion-phase and smoothed temporal
+classifiers and accepts a stroke only when they agree and exceed a distance
+margin chosen from training videos. `selective_classification` reports accepted
+accuracy, coverage, abstentions, and confident false alerts separately from the
+unfiltered end-to-end benchmark.
+
+Peak-aligned classification is available as an offline experiment:
+
+```bash
+python -m rtmpose_tennis.stroke_pipeline \
+  --pose-dir ./data/output \
+  --annotations ./data/annotations \
+  --classifier-alignment peak \
+  --report ./data/output/stroke-pipeline-peak.json
+```
+
+This retains adaptive boundaries for interval matching and reporting, but
+extracts temporal classifier features from a consistent window around the
+proposal's dominant-wrist motion peak. Each held-video fold selects the window
+before/after the peak using only its training videos. Interval alignment remains
+the default because it currently performs better on the five-video benchmark.
 
 Useful options:
 
@@ -173,6 +297,7 @@ rtmpose-tennis --camera 1 --device cuda:0 --width 1280 --height 720
 rtmpose-tennis --video ./samples/forehand.mp4 --device cuda:0
 rtmpose-tennis --device cpu --score-threshold 0.4
 rtmpose-tennis --camera 0 --handedness right
+rtmpose-tennis --video ./samples/forehand.mp4 --pose-log ./data/output/forehand.jsonl
 ```
 
 ## Performance tuning
@@ -290,5 +415,5 @@ sequence (serve, forehand, backhand, ready position). Keep feedback as a separat
 layer driven by joint angles and phase timing so it can explain a classification.
 
 For robust court use, the immediate upgrades are persistent person tracking,
-optional side/rear camera calibration, racket/ball detection, and a recording
-mode that saves timestamped keypoint sequences for labelling.
+optional side/rear camera calibration, and a recording mode that saves
+timestamped keypoint sequences for labelling.

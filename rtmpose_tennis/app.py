@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 import time
 from collections import Counter, deque
@@ -31,9 +32,14 @@ COCO_KEYPOINT_NAMES = (
     "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee",
     "right_knee", "left_ankle", "right_ankle",
 )
-COCO_TENNIS_RACKET_LABEL = 38
 LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
+LEFT_ELBOW, RIGHT_ELBOW = 7, 8
 LEFT_WRIST, RIGHT_WRIST = 9, 10
+LEFT_HIP, RIGHT_HIP = 11, 12
+BILATERAL_KEYPOINT_PAIRS = (
+    (1, 2), (3, 4), (5, 6), (7, 8), (9, 10),
+    (11, 12), (13, 14), (15, 16),
+)
 
 
 @dataclass
@@ -67,8 +73,6 @@ class DetectorRequest:
     sequence: int
     requested_at: float
     reason: str
-    pose_keypoints: np.ndarray | None = None
-    pose_scores: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -102,12 +106,11 @@ class HandednessSnapshot:
     locked: bool
     left_evidence: float
     right_evidence: float
-    racket_observations: int
     motion_observations: int
 
 
 class HandednessEstimator:
-    """Accumulate conservative racket and wrist-motion handedness evidence."""
+    """Accumulate conservative wrist-motion handedness evidence."""
 
     def __init__(self, mode: str = "auto") -> None:
         self._mode = mode
@@ -117,14 +120,7 @@ class HandednessEstimator:
         self._previous_scores: np.ndarray | None = None
         self._previous_at: float | None = None
         self._last_motion_vote_at = float("-inf")
-        self.racket_observations = 0
         self.motion_observations = 0
-
-    @staticmethod
-    def _point_box_distance(point: np.ndarray, box: np.ndarray) -> float:
-        dx = max(float(box[0] - point[0]), 0.0, float(point[0] - box[2]))
-        dy = max(float(box[1] - point[1]), 0.0, float(point[1] - box[3]))
-        return float(np.hypot(dx, dy))
 
     def _add_evidence(self, side: str, weight: float) -> None:
         if self._mode != "auto" or self._locked_label is not None or weight <= 0:
@@ -135,52 +131,6 @@ class HandednessEstimator:
         share = self._evidence[winner] / max(total, 1e-6)
         if total >= 10.0 and share >= 0.82:
             self._locked_label = winner
-
-    def observe_detector(
-        self,
-        result: dict[str, Any],
-        keypoints: np.ndarray | None,
-        scores: np.ndarray | None,
-        score_threshold: float,
-    ) -> None:
-        if self._mode != "auto" or keypoints is None or scores is None:
-            return
-        if len(keypoints) <= RIGHT_WRIST or len(scores) <= RIGHT_WRIST:
-            return
-        required = (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_WRIST, RIGHT_WRIST)
-        if any(float(scores[index]) < score_threshold for index in required):
-            return
-        shoulder_width = float(
-            np.linalg.norm(keypoints[LEFT_SHOULDER] - keypoints[RIGHT_SHOULDER])
-        )
-        if shoulder_width < 5.0:
-            return
-        predictions = result.get("predictions", [])
-        if not predictions:
-            return
-        prediction = predictions[0]
-        boxes = np.asarray(prediction.get("bboxes", []), dtype=np.float32).reshape(-1, 4)
-        detector_scores = np.asarray(prediction.get("scores", []), dtype=np.float32).reshape(-1)
-        labels = np.asarray(prediction.get("labels", []), dtype=np.int64).reshape(-1)
-        best: tuple[float, str, float] | None = None
-        for box, detector_score, label in zip(boxes, detector_scores, labels):
-            if label != COCO_TENNIS_RACKET_LABEL or detector_score < 0.2:
-                continue
-            left_distance = self._point_box_distance(keypoints[LEFT_WRIST], box)
-            right_distance = self._point_box_distance(keypoints[RIGHT_WRIST], box)
-            nearest = min(left_distance, right_distance)
-            separation = abs(left_distance - right_distance)
-            if nearest > 2.0 * shoulder_width or separation < 0.2 * shoulder_width:
-                continue
-            side = "left" if left_distance < right_distance else "right"
-            rank = float(detector_score) * separation / shoulder_width
-            if best is None or rank > best[0]:
-                best = (rank, side, float(detector_score))
-        if best is None:
-            return
-        rank, side, detector_score = best
-        self.racket_observations += 1
-        self._add_evidence(side, detector_score * min(2.0, rank))
 
     def observe_pose(
         self,
@@ -244,7 +194,7 @@ class HandednessEstimator:
                 self._mode, 1.0, True,
                 1.0 if self._mode == "left" else 0.0,
                 1.0 if self._mode == "right" else 0.0,
-                self.racket_observations, self.motion_observations,
+                self.motion_observations,
             )
         total = self._evidence["left"] + self._evidence["right"]
         winner = max(self._evidence, key=self._evidence.get)
@@ -263,9 +213,250 @@ class HandednessEstimator:
             locked=self._locked_label is not None,
             left_evidence=self._evidence["left"],
             right_evidence=self._evidence["right"],
-            racket_observations=self.racket_observations,
             motion_observations=self.motion_observations,
         )
+
+
+@dataclass(frozen=True)
+class PoseFeatures:
+    canonical_handedness: str
+    torso_scale_px: float
+    shoulder_angle_rad: float
+    hip_angle_rad: float
+    shoulder_hip_angle_rad: float
+    left_wrist_speed: float | None
+    right_wrist_speed: float | None
+    dominant_wrist_x: float | None
+    dominant_wrist_y: float | None
+    dominant_wrist_vx: float | None
+    dominant_wrist_vy: float | None
+    dominant_wrist_speed: float | None
+    dominant_wrist_acceleration: float | None
+    dominant_elbow_angle_rad: float | None
+    dominant_arm_extension: float | None
+    wrist_distance: float
+    dominant_crossed_midline: bool | None
+    mean_keypoint_score: float
+
+
+@dataclass(frozen=True)
+class TemporalPoseFrame:
+    sequence: int
+    captured_at: float
+    normalized_keypoints: np.ndarray
+    scores: np.ndarray
+    features: PoseFeatures
+
+
+class PoseFeatureExtractor:
+    """Normalize poses into a body frame and derive temporal stroke features."""
+
+    def __init__(self) -> None:
+        self._previous: TemporalPoseFrame | None = None
+        self._previous_velocity: np.ndarray | None = None
+
+    @staticmethod
+    def _wrapped_angle(angle: float) -> float:
+        return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+    @staticmethod
+    def _joint_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float | None:
+        first = a - b
+        second = c - b
+        denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
+        if denominator < 1e-6:
+            return None
+        cosine = float(np.clip(np.dot(first, second) / denominator, -1.0, 1.0))
+        return float(np.arccos(cosine))
+
+    @staticmethod
+    def _canonicalize_left(
+        keypoints: np.ndarray,
+        scores: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        canonical_keypoints = keypoints.copy()
+        canonical_scores = scores.copy()
+        canonical_keypoints[:, 0] *= -1.0
+        for left, right in BILATERAL_KEYPOINT_PAIRS:
+            canonical_keypoints[[left, right]] = canonical_keypoints[[right, left]]
+            canonical_scores[[left, right]] = canonical_scores[[right, left]]
+        return canonical_keypoints, canonical_scores
+
+    def extract(
+        self,
+        player: PlayerPose | None,
+        sequence: int,
+        captured_at: float,
+        handedness: str,
+        score_threshold: float,
+    ) -> TemporalPoseFrame | None:
+        if player is None or len(player.keypoints) < len(COCO_KEYPOINT_NAMES):
+            self._previous = None
+            self._previous_velocity = None
+            return None
+        required = (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP)
+        if any(float(player.scores[index]) < score_threshold for index in required):
+            self._previous = None
+            self._previous_velocity = None
+            return None
+        points = player.keypoints.astype(np.float32, copy=False)
+        scores = player.scores.astype(np.float32, copy=True)
+        shoulder_vector = points[RIGHT_SHOULDER] - points[LEFT_SHOULDER]
+        shoulder_width = float(np.linalg.norm(shoulder_vector))
+        if shoulder_width < 5.0:
+            self._previous = None
+            self._previous_velocity = None
+            return None
+        hip_center = (points[LEFT_HIP] + points[RIGHT_HIP]) / 2.0
+        shoulder_center = (points[LEFT_SHOULDER] + points[RIGHT_SHOULDER]) / 2.0
+        x_axis = shoulder_vector / shoulder_width
+        y_axis = np.asarray([-x_axis[1], x_axis[0]], dtype=np.float32)
+        if float(np.dot(y_axis, hip_center - shoulder_center)) < 0:
+            y_axis *= -1.0
+        relative = points - hip_center
+        normalized = np.column_stack((relative @ x_axis, relative @ y_axis)) / shoulder_width
+        canonical_handedness = handedness if handedness in ("left", "right") else "unknown"
+        if canonical_handedness == "left":
+            normalized, scores = self._canonicalize_left(normalized, scores)
+
+        shoulder_angle = float(np.arctan2(shoulder_vector[1], shoulder_vector[0]))
+        hip_vector = points[RIGHT_HIP] - points[LEFT_HIP]
+        hip_angle = float(np.arctan2(hip_vector[1], hip_vector[0]))
+        dt: float | None = None
+        velocity: np.ndarray | None = None
+        acceleration: np.ndarray | None = None
+        previous = self._previous
+        if (
+            previous is not None
+            and previous.features.canonical_handedness == canonical_handedness
+        ):
+            dt = captured_at - previous.captured_at
+            if 0 < dt <= 0.25:
+                velocity = (normalized - previous.normalized_keypoints) / dt
+                if self._previous_velocity is not None:
+                    acceleration = (velocity - self._previous_velocity) / dt
+
+        left_speed = float(np.linalg.norm(velocity[LEFT_WRIST])) if velocity is not None else None
+        right_speed = float(np.linalg.norm(velocity[RIGHT_WRIST])) if velocity is not None else None
+        known_hand = canonical_handedness in ("left", "right")
+        dominant_wrist = RIGHT_WRIST if known_hand else None
+        dominant_elbow = RIGHT_ELBOW if known_hand else None
+        dominant_shoulder = RIGHT_SHOULDER if known_hand else None
+        dominant_velocity = velocity[dominant_wrist] if velocity is not None and dominant_wrist is not None else None
+        dominant_acceleration = (
+            acceleration[dominant_wrist]
+            if acceleration is not None and dominant_wrist is not None
+            else None
+        )
+        dominant_elbow_angle = (
+            self._joint_angle(
+                normalized[dominant_shoulder],
+                normalized[dominant_elbow],
+                normalized[dominant_wrist],
+            )
+            if dominant_wrist is not None
+            and dominant_elbow is not None
+            and dominant_shoulder is not None
+            and min(
+                float(scores[dominant_shoulder]),
+                float(scores[dominant_elbow]),
+                float(scores[dominant_wrist]),
+            ) >= score_threshold
+            else None
+        )
+        features = PoseFeatures(
+            canonical_handedness=canonical_handedness,
+            torso_scale_px=shoulder_width,
+            shoulder_angle_rad=shoulder_angle,
+            hip_angle_rad=hip_angle,
+            shoulder_hip_angle_rad=self._wrapped_angle(shoulder_angle - hip_angle),
+            left_wrist_speed=left_speed,
+            right_wrist_speed=right_speed,
+            dominant_wrist_x=(float(normalized[dominant_wrist, 0]) if dominant_wrist is not None else None),
+            dominant_wrist_y=(float(normalized[dominant_wrist, 1]) if dominant_wrist is not None else None),
+            dominant_wrist_vx=(float(dominant_velocity[0]) if dominant_velocity is not None else None),
+            dominant_wrist_vy=(float(dominant_velocity[1]) if dominant_velocity is not None else None),
+            dominant_wrist_speed=(float(np.linalg.norm(dominant_velocity)) if dominant_velocity is not None else None),
+            dominant_wrist_acceleration=(float(np.linalg.norm(dominant_acceleration)) if dominant_acceleration is not None else None),
+            dominant_elbow_angle_rad=dominant_elbow_angle,
+            dominant_arm_extension=(
+                float(np.linalg.norm(normalized[dominant_wrist] - normalized[dominant_shoulder]))
+                if dominant_wrist is not None and dominant_shoulder is not None
+                else None
+            ),
+            wrist_distance=float(np.linalg.norm(normalized[LEFT_WRIST] - normalized[RIGHT_WRIST])),
+            dominant_crossed_midline=(
+                bool(normalized[dominant_wrist, 0] < 0.0)
+                if dominant_wrist is not None
+                else None
+            ),
+            mean_keypoint_score=float(np.mean(scores)),
+        )
+        temporal_frame = TemporalPoseFrame(
+            sequence=sequence,
+            captured_at=captured_at,
+            normalized_keypoints=normalized.astype(np.float32),
+            scores=scores,
+            features=features,
+        )
+        self._previous = temporal_frame
+        self._previous_velocity = velocity
+        return temporal_frame
+
+
+class TemporalPoseBuffer:
+    """Keep only the latest time-bounded window of normalized poses."""
+
+    def __init__(self, duration_seconds: float) -> None:
+        self.duration_seconds = duration_seconds
+        self._frames: deque[TemporalPoseFrame] = deque()
+        self._canonical_handedness: str | None = None
+
+    def add(self, frame: TemporalPoseFrame) -> None:
+        handedness = frame.features.canonical_handedness
+        if self._canonical_handedness is not None and handedness != self._canonical_handedness:
+            self._frames.clear()
+        self._canonical_handedness = handedness
+        self._frames.append(frame)
+        cutoff = frame.captured_at - self.duration_seconds
+        while self._frames and self._frames[0].captured_at < cutoff:
+            self._frames.popleft()
+
+    @property
+    def frames(self) -> tuple[TemporalPoseFrame, ...]:
+        return tuple(self._frames)
+
+    def __len__(self) -> int:
+        return len(self._frames)
+
+
+class PoseFeatureLogger:
+    """Write normalized pose samples as newline-delimited JSON for analysis."""
+
+    def __init__(self, path: Path, session_started: float) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._session_started = session_started
+        self._file = path.open("w", encoding="utf-8")
+        self.count = 0
+
+    def write(self, frame: TemporalPoseFrame) -> None:
+        features = {
+            name: getattr(frame.features, name)
+            for name in PoseFeatures.__dataclass_fields__
+        }
+        record = {
+            "sequence": frame.sequence,
+            "time_seconds": frame.captured_at - self._session_started,
+            "normalized_keypoints": frame.normalized_keypoints.tolist(),
+            "scores": frame.scores.tolist(),
+            "features": features,
+        }
+        self._file.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self.count += 1
+
+    def close(self) -> None:
+        self._file.close()
 
 
 @dataclass
@@ -970,6 +1161,19 @@ def parse_args() -> argparse.Namespace:
         help="Player handedness or automatic temporal inference (default: auto)",
     )
     parser.add_argument(
+        "--pose-buffer-seconds",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="Duration of the in-memory normalized pose window (default: 2)",
+    )
+    parser.add_argument(
+        "--pose-log",
+        type=Path,
+        metavar="PATH",
+        help="Optionally write normalized poses and temporal features as JSONL",
+    )
+    parser.add_argument(
         "--preview-scale",
         type=float,
         default=1.0,
@@ -1031,6 +1235,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--preview-scale must be greater than 0 and at most 1")
     if args.status_interval <= 0:
         parser.error("--status-interval must be greater than 0")
+    if args.pose_buffer_seconds <= 0:
+        parser.error("--pose-buffer-seconds must be greater than 0")
     return args
 
 
@@ -1038,6 +1244,8 @@ def main() -> None:
     args = parse_args()
     hybrid_enabled = bool(args.detector_interval or args.detector_interval_seconds)
     handedness_estimator = HandednessEstimator(args.handedness)
+    pose_feature_extractor = PoseFeatureExtractor()
+    temporal_pose_buffer = TemporalPoseBuffer(args.pose_buffer_seconds)
     pose_model_name = POSE_MODEL_PRESETS.get(args.model, args.model)
     base_kwargs: dict[str, Any] = {"pose2d": pose_model_name, "device": args.device}
     if hybrid_enabled:
@@ -1088,6 +1296,9 @@ def main() -> None:
     pose_timings: deque[float] = deque(maxlen=60)
     session_pose_timings: list[float] = []
     handedness_timings: list[float] = []
+    pose_feature_timings: list[float] = []
+    pose_log_timings: list[float] = []
+    temporal_pose_frames = 0
     display_timings: deque[float] = deque(maxlen=60)
     loop_timings: deque[float] = deque(maxlen=60)
     inference_wait_timings: deque[float] = deque(maxlen=120)
@@ -1156,6 +1367,11 @@ def main() -> None:
     else:
         frame_source = frames(args.camera, args.video, args.width, args.height)
     session_started = time.perf_counter()
+    pose_feature_logger = (
+        PoseFeatureLogger(args.pose_log, session_started)
+        if args.pose_log is not None
+        else None
+    )
     warmup_ends = session_started + args.metrics_warmup_seconds
     session_ended = session_started
     status_last_at = session_started
@@ -1183,14 +1399,6 @@ def main() -> None:
                         steady_detector_results_completed += 1
                         steady_detector_result_latencies.append(result_latency)
                         steady_detector_result_lags.append(result_lag)
-                    handedness_started = time.perf_counter()
-                    handedness_estimator.observe_detector(
-                        completed_detection.prediction,
-                        completed_detection.request.pose_keypoints,
-                        completed_detection.request.pose_scores,
-                        args.score_threshold,
-                    )
-                    handedness_timings.append(time.perf_counter() - handedness_started)
                     player_bbox = select_player_bbox(
                         completed_detection.prediction,
                         completed_detection.request.frame_shape,
@@ -1250,12 +1458,6 @@ def main() -> None:
                                 sequence=packet.sequence,
                                 requested_at=time.perf_counter(),
                                 reason=detection_reason,
-                                pose_keypoints=(
-                                    player.keypoints.copy() if player is not None else None
-                                ),
-                                pose_scores=(
-                                    player.scores.copy() if player is not None else None
-                                ),
                             ))
                             if accepted:
                                 detector_refreshes += 1
@@ -1275,16 +1477,6 @@ def main() -> None:
                             detector_started = time.perf_counter()
                             detection_result = detector_inferencer(frame, return_vis=False)
                             detector_timings.append(time.perf_counter() - detector_started)
-                            handedness_started = time.perf_counter()
-                            handedness_estimator.observe_detector(
-                                detection_result,
-                                player.keypoints if player is not None else None,
-                                player.scores if player is not None else None,
-                                args.score_threshold,
-                            )
-                            handedness_timings.append(
-                                time.perf_counter() - handedness_started
-                            )
                             player_bbox = select_player_bbox(
                                 detection_result,
                                 frame.shape,
@@ -1367,6 +1559,22 @@ def main() -> None:
                     args.score_threshold,
                 )
                 handedness_timings.append(time.perf_counter() - handedness_started)
+                feature_started = time.perf_counter()
+                temporal_pose = pose_feature_extractor.extract(
+                    player=player,
+                    sequence=packet.sequence,
+                    captured_at=packet.captured_at,
+                    handedness=handedness_estimator.snapshot.label,
+                    score_threshold=args.score_threshold,
+                )
+                if temporal_pose is not None:
+                    temporal_pose_buffer.add(temporal_pose)
+                    temporal_pose_frames += 1
+                pose_feature_timings.append(time.perf_counter() - feature_started)
+                if temporal_pose is not None and pose_feature_logger is not None:
+                    log_started = time.perf_counter()
+                    pose_feature_logger.write(temporal_pose)
+                    pose_log_timings.append(time.perf_counter() - log_started)
                 inference_timings.append(time.perf_counter() - inference_started)
                 if player is not None:
                     pose_output_frames += 1
@@ -1416,6 +1624,7 @@ def main() -> None:
                         f"pose={average_ms(pose_timings)} ms, "
                         f"hand={status_handedness.label} "
                         f"({status_handedness.confidence:.0%}), "
+                        f"pose window={len(temporal_pose_buffer)}, "
                         f"dropped={100.0 * skipped_so_far / max(captured_so_far, 1):.1f}%",
                         flush=True,
                     )
@@ -1531,6 +1740,8 @@ def main() -> None:
             async_capture.close()
         if detector_worker is not None:
             detector_worker.close()
+        if pose_feature_logger is not None:
+            pose_feature_logger.close()
         if not args.headless:
             cv2.destroyAllWindows()
     session_duration = max(0.0, session_ended - session_started)
@@ -1601,12 +1812,25 @@ def main() -> None:
         f"locked={'yes' if handedness.locked else 'no'}, "
         f"evidence left/right={handedness.left_evidence:.2f}/"
         f"{handedness.right_evidence:.2f}, "
-        f"racket observations={handedness.racket_observations}, "
         f"motion observations={handedness.motion_observations}, "
         f"overhead p50/p95={percentile_ms(handedness_timings, 50)}/"
         f"{percentile_ms(handedness_timings, 95)} ms",
         flush=True,
     )
+    print(
+        "Temporal pose pipeline: "
+        f"generated={temporal_pose_frames}, "
+        f"window={len(temporal_pose_buffer)} frame(s)/"
+        f"{args.pose_buffer_seconds:g} s, "
+        f"feature overhead p50/p95={percentile_ms(pose_feature_timings, 50)}/"
+        f"{percentile_ms(pose_feature_timings, 95)} ms, "
+        f"logged={pose_feature_logger.count if pose_feature_logger is not None else 0}, "
+        f"log overhead p50/p95={percentile_ms(pose_log_timings, 50)}/"
+        f"{percentile_ms(pose_log_timings, 95)} ms",
+        flush=True,
+    )
+    if pose_feature_logger is not None:
+        print(f"Pose feature log: {pose_feature_logger.path}", flush=True)
     if hybrid_enabled:
         if detector_worker is not None:
             print(
